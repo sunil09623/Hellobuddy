@@ -484,7 +484,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const isBlocked = Boolean(active && (isBlockedByMe || activeConversation?.blocked));
 
   async function clearChat() {
-    if (!conversation || requestBusy || !window.confirm('Clear this chat from your account? The other person will keep their messages.')) return;
+    if (!conversation || requestBusy) return;
     setRequestBusy(true);
     try {
       const response = await fetch(`${API}/api/conversations/${conversation}/messages`, { method: 'DELETE', headers: authHeaders() });
@@ -492,6 +492,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       if (!response.ok) throw new Error(data.error || 'Unable to clear chat');
       setMessages([]);
       setMoreOpen(false);
+      setError('Chat cleared from your account.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to clear chat');
     } finally {
@@ -500,7 +501,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }
 
   async function deleteChat() {
-    if (!conversation || requestBusy || !window.confirm('Delete this chat from your account? The other person will keep their chat.')) return;
+    if (!conversation || requestBusy) return;
     const conversationId = conversation;
     setRequestBusy(true);
     try {
@@ -516,6 +517,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       setMessages([]);
       setSelectedRequest(null);
       setMoreOpen(false);
+      setError('Chat deleted from your account.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to delete chat');
     } finally {
