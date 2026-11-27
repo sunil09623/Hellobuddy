@@ -49,13 +49,17 @@ On narrow screens, the contacts list is shown first. Selecting a contact switche
 
 ## End-to-end encrypted messages
 
-New messages and conversation-request first messages are encrypted in the browser with AES-256-GCM before they are sent to the API. ECDH P-256 and HKDF-SHA-256 derive the shared key. The server stores and relays ciphertext; it does not decrypt message bodies. Existing messages and requests remain in their current plaintext format.
+New messages and conversation-request first messages are encrypted in the browser with AES-256-GCM before they are sent to the API. ECDH P-256 and HKDF-SHA-256 derive the shared key. The server stores and relays ciphertext; it does not decrypt message bodies.
 
-Private keys are non-exportable and stored in IndexedDB for the browser that created them. Clearing that browser's site data or signing in from another browser makes encrypted messages inaccessible. A contact must sign in once after this feature is deployed before you can send them a new encrypted request.
+Each account has one encryption key pair. The private key is wrapped on the client with AES-GCM using a key derived from the user's account encryption passphrase (PBKDF2-SHA-256); the server stores only the wrapped ciphertext. After unlocking, each browser stores a non-exportable local copy in IndexedDB. A new browser can recover the same account key with the passphrase. Losing the passphrase means encrypted history cannot be recovered.
+
+On first setup, accounts that already have a device-only key rotate to an account key. Encrypted messages and encrypted conversation-request first messages from the legacy key are permanently deleted for both participants; plaintext history is not changed. The setup screen requires confirmation before this deletion.
 
 Contact public keys are trusted on first use and pinned locally. A later key change is blocked. First-use keys are supplied by the server, so this does not protect against a malicious server substituting a key during the first exchange. This design also does not provide forward secrecy.
 
-Before deploying the API update to an existing database, run `npx prisma db push` from `server` to add the public-key column and widen message storage columns. Deploy the API/schema before the client; otherwise clients cannot initialize secure messaging.
+Before deploying the API update to an existing database, run `npx prisma db push` from `server` to add the account-key backup/version columns and widen message storage columns. Confirm that `DATABASE_URL` and `DIRECT_URL` point to the intended database before running it. Deploy the API/schema before the client; otherwise clients cannot initialize secure messaging.
+
+Blocked users can send messages to the person who blocked them, but those messages are queued without delivery/read receipts or notifications until the blocker unblocks them. Deleting a conversation removes it and its request for both users; a new conversation must start with a fresh request.
 
 ## Stack
 React + TypeScript + Vite, Express + TypeScript, Socket.IO, Prisma, PostgreSQL.\n

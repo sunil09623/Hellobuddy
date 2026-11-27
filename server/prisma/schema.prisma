@@ -36,6 +36,8 @@ model User {
   avatarData String? @db.Text
   avatarColor String @default("#5524c8") @db.VarChar(7)
   encryptionPublicKey String? @db.Text
+  encryptionPrivateKeyBackup String? @db.Text
+  encryptionKeyVersion Int @default(1)
   passwordHash String
   createdAt DateTime @default(now())
   emailVerification EmailVerification?

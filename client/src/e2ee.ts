@@ -22,7 +22,17 @@ export type EncryptionContext =
   | { kind: 'message'; conversationId: string; clientMessageId: string; senderId: string; recipientId: string }
   | { kind: 'request'; requestId: string; requesterId: string; recipientId: string };
 
-type StoredPeerKey = { id: string; publicKey: EncryptionPublicKey };
+export type WrappedPrivateKey = {
+  version: 1;
+  iterations: number;
+  salt: string;
+  iv: string;
+  ciphertext: string;
+};
+
+type StoredPeerKey = { id: string; publicKey: EncryptionPublicKey; keyVersion?: number };
+const PASSPHRASE_ITERATIONS = 600_000;
+const PRIVATE_KEY_AAD_PREFIX = 'hb-e2ee:account-key:v1:';
 
 function openDatabase(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -117,10 +127,128 @@ export async function loadLocalIdentity(userId: string) {
   return readRecord<EncryptionIdentity>(IDENTITY_STORE, userId);
 }
 
-export async function createLocalIdentity(userId: string): Promise<EncryptionIdentity> {
-  const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+function privateKeyAdditionalData(userId: string, publicKey: EncryptionPublicKey) {
+  return encoder.encode(`${PRIVATE_KEY_AAD_PREFIX}${userId}:${publicKey.x}:${publicKey.y}`);
+}
+
+async function derivePassphraseKey(passphrase: string, salt: Uint8Array, iterations: number) {
+  const material = await crypto.subtle.importKey('raw', encoder.encode(passphrase), 'PBKDF2', false, ['deriveKey']);
+  const saltBuffer = new ArrayBuffer(salt.length);
+  new Uint8Array(saltBuffer).set(salt);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: saltBuffer, iterations, hash: 'SHA-256' },
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+export async function createWrappedIdentity(userId: string, passphrase: string) {
+  const pair = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
   const publicKey = parseEncryptionPublicKey(await crypto.subtle.exportKey('jwk', pair.publicKey));
-  return { userId, privateKey: pair.privateKey, publicKey };
+  const pkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', pair.privateKey));
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const wrappingKey = await derivePassphraseKey(passphrase, salt, PASSPHRASE_ITERATIONS);
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({
+    name: 'AES-GCM',
+    iv,
+    additionalData: privateKeyAdditionalData(userId, publicKey),
+    tagLength: 128
+  }, wrappingKey, pkcs8));
+  const privateKey = await crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    ['deriveBits']
+  );
+  pkcs8.fill(0);
+  return {
+    identity: { userId, privateKey, publicKey } satisfies EncryptionIdentity,
+    wrappedPrivateKey: {
+      version: 1 as const,
+      iterations: PASSPHRASE_ITERATIONS,
+      salt: encodeBase64Url(salt),
+      iv: encodeBase64Url(iv),
+      ciphertext: encodeBase64Url(ciphertext)
+    } satisfies WrappedPrivateKey
+  };
+}
+
+function parseWrappedPrivateKey(value: unknown): WrappedPrivateKey {
+  if (typeof value !== 'object' || value === null) throw new Error('Invalid encrypted account key');
+  const backup = value as Record<string, unknown>;
+  if (backup.version !== 1 ||
+      typeof backup.iterations !== 'number' || !Number.isInteger(backup.iterations) ||
+      backup.iterations < 100_000 || backup.iterations > 1_000_000 ||
+      typeof backup.salt !== 'string' || !/^[A-Za-z0-9_-]{22}$/.test(backup.salt) ||
+      typeof backup.iv !== 'string' || !/^[A-Za-z0-9_-]{16}$/.test(backup.iv) ||
+      typeof backup.ciphertext !== 'string' || !/^[A-Za-z0-9_-]{100,512}$/.test(backup.ciphertext)) {
+    throw new Error('Invalid encrypted account key');
+  }
+  return {
+    version: 1,
+    iterations: backup.iterations,
+    salt: backup.salt,
+    iv: backup.iv,
+    ciphertext: backup.ciphertext
+  };
+}
+
+async function verifyKeyPair(privateKey: CryptoKey, publicKey: EncryptionPublicKey) {
+  const ephemeral = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveBits']);
+  const importedPublicKey = await crypto.subtle.importKey(
+    'jwk',
+    publicKey,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    []
+  );
+  const [fromPrivate, fromPublic] = await Promise.all([
+    crypto.subtle.deriveBits({ name: 'ECDH', public: ephemeral.publicKey }, privateKey, 256),
+    crypto.subtle.deriveBits({ name: 'ECDH', public: importedPublicKey }, ephemeral.privateKey, 256)
+  ]);
+  const left = new Uint8Array(fromPrivate);
+  const right = new Uint8Array(fromPublic);
+  return left.length === right.length && left.every((byte, index) => byte === right[index]);
+}
+
+export async function unlockWrappedIdentity(
+  userId: string,
+  value: unknown,
+  publicKeyValue: unknown,
+  passphrase: string
+): Promise<EncryptionIdentity> {
+  const wrappedPrivateKey = parseWrappedPrivateKey(value);
+  const publicKey = parseEncryptionPublicKey(publicKeyValue);
+  let pkcs8: ArrayBuffer;
+  try {
+    const wrappingKey = await derivePassphraseKey(
+      passphrase,
+      decodeBase64Url(wrappedPrivateKey.salt),
+      wrappedPrivateKey.iterations
+    );
+    pkcs8 = await crypto.subtle.decrypt({
+      name: 'AES-GCM',
+      iv: decodeBase64Url(wrappedPrivateKey.iv),
+      additionalData: privateKeyAdditionalData(userId, publicKey),
+      tagLength: 128
+    }, wrappingKey, decodeBase64Url(wrappedPrivateKey.ciphertext));
+  } catch {
+    throw new Error('Incorrect passphrase or damaged account key backup.');
+  }
+  const privateKey = await crypto.subtle.importKey(
+    'pkcs8',
+    pkcs8,
+    { name: 'ECDH', namedCurve: 'P-256' },
+    false,
+    ['deriveBits']
+  );
+  new Uint8Array(pkcs8).fill(0);
+  if (!await verifyKeyPair(privateKey, publicKey)) throw new Error('The saved account key does not match its public key.');
+  return { userId, privateKey, publicKey };
 }
 
 export async function saveLocalIdentity(identity: EncryptionIdentity) {
@@ -131,14 +259,20 @@ export async function removeLocalIdentity(userId: string) {
   await deleteRecord(IDENTITY_STORE, userId);
 }
 
-export async function pinPeerPublicKey(ownerId: string, peerId: string, value: unknown) {
+export async function pinPeerPublicKey(ownerId: string, peerId: string, value: unknown, keyVersion: number) {
   const publicKey = parseEncryptionPublicKey(value);
   const id = `${ownerId}:${peerId}`;
   const saved = await readRecord<StoredPeerKey>(PEER_KEY_STORE, id);
-  if (saved && !samePublicKey(saved.publicKey, publicKey)) {
+  const savedVersion = saved?.keyVersion ?? 1;
+  if (saved && keyVersion < savedVersion) {
+    throw new Error("This contact's encryption key version is out of date.");
+  }
+  if (saved && keyVersion === savedVersion && !samePublicKey(saved.publicKey, publicKey)) {
     throw new Error("This contact's encryption key changed. Verify their identity before continuing.");
   }
-  if (!saved) await writeRecord(PEER_KEY_STORE, { id, publicKey } satisfies StoredPeerKey);
+  if (!saved || keyVersion > savedVersion) {
+    await writeRecord(PEER_KEY_STORE, { id, publicKey, keyVersion } satisfies StoredPeerKey);
+  }
   return publicKey;
 }
 

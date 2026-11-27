@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEve
 import { io, type Socket } from 'socket.io-client';
 import { ArrowLeft, Ban, Bell, BellOff, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
 import { API } from '../config';
-import { createLocalIdentity, decryptText, encryptText, ENCRYPTED_MESSAGE_PREFIX, loadLocalIdentity, parseEncryptionPublicKey, pinPeerPublicKey, saveLocalIdentity, type EncryptionIdentity, type EncryptionPublicKey, type EncryptionContext } from '../e2ee';
+import { createWrappedIdentity, decryptText, encryptText, ENCRYPTED_MESSAGE_PREFIX, loadLocalIdentity, parseEncryptionPublicKey, pinPeerPublicKey, removeLocalIdentity, saveLocalIdentity, unlockWrappedIdentity, type EncryptionIdentity, type EncryptionPublicKey, type EncryptionContext, type WrappedPrivateKey } from '../e2ee';
 import type { User } from '../types';
 import { ProfileEditor } from './ProfileEditor';
 
@@ -10,7 +10,7 @@ type Receipt = { userId: string; deliveredAt: string | null; readAt: string | nu
 type Reaction = { emoji: string; count: number; reactedByMe: boolean };
 type Message = { id: string; clientMessageId: string; conversationId: string; senderId: string; body: string; createdAt: string; receipts?: Receipt[]; reactions?: Reaction[] };
 type ReceiptUpdate = { messageId: string; conversationId: string; userId: string; deliveredAt: string | null; readAt: string | null };
-type Conversation = { id: string; unreadCount: number; members: { userId: string; user: User; clearedAt?: string | null; deletedAt?: string | null }[]; blocked: boolean };
+type Conversation = { id: string; unreadCount: number; members: { userId: string; user: User; clearedAt?: string | null; deletedAt?: string | null }[]; blocked: boolean; blockedByMe: boolean; blockedMe: boolean };
 type ConversationRequest = {
   id: string;
   requesterId: string;
@@ -32,6 +32,7 @@ type DashboardProps = {
   onLogout: () => void;
 };
 const EMOJI_OPTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🎉', '🔥'];
+type EncryptionSetupMode = 'setup' | 'unlock';
 
 export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }: DashboardProps) {
   const [people, setPeople] = useState<User[]>([]);
@@ -41,6 +42,14 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [requests, setRequests] = useState<ConversationRequest[]>([]);
   const [encryptionReady, setEncryptionReady] = useState(false);
   const [encryptionError, setEncryptionError] = useState('');
+  const [encryptionSetupMode, setEncryptionSetupMode] = useState<EncryptionSetupMode | null>(null);
+  const [encryptionWrappedKey, setEncryptionWrappedKey] = useState<WrappedPrivateKey | null>(null);
+  const [encryptionServerPublicKey, setEncryptionServerPublicKey] = useState<EncryptionPublicKey | null>(null);
+  const [legacyHistoryResetRequired, setLegacyHistoryResetRequired] = useState(false);
+  const [legacyHistoryResetConfirmed, setLegacyHistoryResetConfirmed] = useState(false);
+  const [encryptionPassphrase, setEncryptionPassphrase] = useState('');
+  const [encryptionPassphraseConfirmation, setEncryptionPassphraseConfirmation] = useState('');
+  const [encryptionWorking, setEncryptionWorking] = useState(false);
   const notificationStorageKey = `hellobuddy-notifications:${user.id}`;
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem(notificationStorageKey) !== 'false');
   const [notification, setNotification] = useState('');
@@ -72,6 +81,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const notificationAudioPrimedRef = useRef(false);
   const encryptionIdentityRef = useRef<EncryptionIdentity | null>(null);
   const peerPublicKeysRef = useRef(new Map<string, EncryptionPublicKey>());
+  const registeringEncryptionKeyRef = useRef(false);
   const activePeerIdRef = useRef('');
   const selectedRequestRef = useRef<ConversationRequest | null>(null);
   const searchRef = useRef(search);
@@ -86,31 +96,35 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const reactionPickerRef = useRef<HTMLDivElement>(null);
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
 
-  async function initializeEncryptionIdentity() {
+  async function initializeEncryptionIdentity(): Promise<EncryptionIdentity | null> {
     const storedIdentity = await loadLocalIdentity(user.id);
     const response = await fetch(`${API}/api/users/me/encryption-key`, { headers: authHeaders() });
-    const data = await response.json() as { publicKey?: unknown; error?: string };
+    const data = await response.json() as { publicKey?: unknown; wrappedPrivateKey?: WrappedPrivateKey | null; error?: string };
     if (!response.ok) throw new Error(data.error || 'Unable to load your encryption key');
     const serverKey = data.publicKey === null || data.publicKey === undefined ? null : parseEncryptionPublicKey(data.publicKey);
-    if (storedIdentity) {
-      if (serverKey && (serverKey.x !== storedIdentity.publicKey.x || serverKey.y !== storedIdentity.publicKey.y)) {
-        throw new Error('This browser encryption key does not match the account key. Use the browser where secure messaging was set up.');
-      }
-      if (!serverKey) await registerEncryptionPublicKey(storedIdentity.publicKey);
-      return storedIdentity;
+    if (serverKey && data.wrappedPrivateKey) {
+      if (storedIdentity && serverKey.x === storedIdentity.publicKey.x && serverKey.y === storedIdentity.publicKey.y) return storedIdentity;
+      if (storedIdentity) await removeLocalIdentity(user.id);
+      setEncryptionWrappedKey(data.wrappedPrivateKey);
+      setEncryptionServerPublicKey(serverKey);
+      setLegacyHistoryResetRequired(false);
+      setLegacyHistoryResetConfirmed(false);
+      setEncryptionSetupMode('unlock');
+      return null;
     }
-    if (serverKey) throw new Error('This account has an encryption key on another browser. Use that browser to read encrypted messages.');
-    const identity = await createLocalIdentity(user.id);
-    await saveLocalIdentity(identity);
-    await registerEncryptionPublicKey(identity.publicKey);
-    return identity;
+    setEncryptionWrappedKey(null);
+    setEncryptionServerPublicKey(serverKey);
+    setLegacyHistoryResetRequired(Boolean(serverKey || storedIdentity));
+    setLegacyHistoryResetConfirmed(false);
+    setEncryptionSetupMode('setup');
+    return null;
   }
 
-  async function registerEncryptionPublicKey(publicKey: EncryptionPublicKey) {
+  async function registerEncryptionPublicKey(publicKey: EncryptionPublicKey, wrappedPrivateKey: WrappedPrivateKey) {
     const response = await fetch(`${API}/api/users/me/encryption-key`, {
       method: 'PUT',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ publicKey })
+      body: JSON.stringify({ publicKey, wrappedPrivateKey })
     });
     const data = await response.json() as { error?: string };
     if (!response.ok) throw new Error(data.error || 'Unable to register your encryption key');
@@ -120,9 +134,10 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     const cachedKey = peerPublicKeysRef.current.get(peerId);
     if (cachedKey) return cachedKey;
     const response = await fetch(`${API}/api/users/${encodeURIComponent(peerId)}/encryption-key`, { headers: authHeaders() });
-    const data = await response.json() as { publicKey?: unknown; error?: string };
+    const data = await response.json() as { publicKey?: unknown; keyVersion?: number; error?: string };
     if (!response.ok || !data.publicKey) throw new Error(data.error || 'This contact has not initialized secure messaging yet.');
-    const publicKey = await pinPeerPublicKey(user.id, peerId, data.publicKey);
+    if (!Number.isInteger(data.keyVersion) || !data.keyVersion || data.keyVersion < 1) throw new Error('This contact has an invalid encryption key version.');
+    const publicKey = await pinPeerPublicKey(user.id, peerId, data.publicKey, data.keyVersion);
     peerPublicKeysRef.current.set(peerId, publicKey);
     return publicKey;
   }
@@ -292,10 +307,11 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     encryptionIdentityRef.current = null;
     setEncryptionReady(false);
     setEncryptionError('');
+    setEncryptionSetupMode(null);
     void initializeEncryptionIdentity().then(identity => {
       if (cancelled) return;
       encryptionIdentityRef.current = identity;
-      setEncryptionReady(true);
+      setEncryptionReady(Boolean(identity));
     }).catch(err => {
       if (cancelled) return;
       const message = err instanceof Error ? err.message : 'Unable to initialize secure messaging';
@@ -304,6 +320,60 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     });
     return () => { cancelled = true; };
   }, [token, user.id]);
+
+  async function completeEncryptionSetup(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!encryptionSetupMode || encryptionWorking) return;
+    if (encryptionSetupMode === 'setup') {
+      if (encryptionPassphrase.length < 12) {
+        setEncryptionError('Choose an account encryption passphrase with at least 12 characters.');
+        return;
+      }
+      if (encryptionPassphrase !== encryptionPassphraseConfirmation) {
+        setEncryptionError('The passphrases do not match.');
+        return;
+      }
+      if (legacyHistoryResetRequired && !legacyHistoryResetConfirmed) {
+        setEncryptionError('Confirm that you understand the old encrypted history will be permanently deleted.');
+        return;
+      }
+    } else if (!encryptionPassphrase) {
+      setEncryptionError('Enter your account encryption passphrase.');
+      return;
+    }
+
+    setEncryptionWorking(true);
+    setEncryptionError('');
+    try {
+      let identity: EncryptionIdentity;
+      if (encryptionSetupMode === 'unlock') {
+        if (!encryptionServerPublicKey || !encryptionWrappedKey) throw new Error('The saved account encryption key is unavailable.');
+        identity = await unlockWrappedIdentity(user.id, encryptionWrappedKey, encryptionServerPublicKey, encryptionPassphrase);
+      } else {
+        const wrapped = await createWrappedIdentity(user.id, encryptionPassphrase);
+        registeringEncryptionKeyRef.current = true;
+        await registerEncryptionPublicKey(wrapped.identity.publicKey, wrapped.wrappedPrivateKey);
+        identity = wrapped.identity;
+      }
+      await saveLocalIdentity(identity);
+      encryptionIdentityRef.current = identity;
+      setEncryptionSetupMode(null);
+      setEncryptionWrappedKey(null);
+      setEncryptionServerPublicKey(null);
+      setEncryptionPassphrase('');
+      setEncryptionPassphraseConfirmation('');
+      setLegacyHistoryResetRequired(false);
+      setLegacyHistoryResetConfirmed(false);
+      setEncryptionReady(true);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Unable to set up account encryption';
+      setEncryptionError(message);
+      setError(message);
+    } finally {
+      registeringEncryptionKeyRef.current = false;
+      setEncryptionWorking(false);
+    }
+  }
 
   useEffect(() => {
     if (!notificationsEnabled) return;
@@ -455,27 +525,64 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         ? { ...message, reactions: update.reactions }
         : message));
     });
+    s.on('encryption:key:update', (event: { userId: string; keyVersion: number }) => {
+      if (event.userId === user.id) {
+        if (registeringEncryptionKeyRef.current) return;
+        encryptionIdentityRef.current = null;
+        activeConversationRef.current = '';
+        setActive(null);
+        setConversation('');
+        setSelectedRequest(null);
+        setChatMode('new');
+        setMessages([]);
+        setEncryptionReady(false);
+        setEncryptionError('');
+        void initializeEncryptionIdentity().then(identity => {
+          encryptionIdentityRef.current = identity;
+          setEncryptionReady(Boolean(identity));
+          if (identity) {
+            void Promise.all([loadConversations(), loadRequests(), loadBlocks()])
+              .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh account data'));
+          }
+        }).catch(err => {
+          const message = err instanceof Error ? err.message : 'Unable to refresh your account encryption key';
+          setEncryptionError(message);
+          setError(message);
+        });
+        return;
+      }
+      peerPublicKeysRef.current.delete(event.userId);
+      activeConversationRef.current = '';
+      setActive(null);
+      setConversation('');
+      setSelectedRequest(null);
+      setChatMode('new');
+      setMessages([]);
+      void Promise.all([getPeerEncryptionKey(event.userId), loadConversations(), loadRequests()])
+        .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh a contact encryption key'));
+    });
     s.on('conversation:cleared', (event: { conversationId: string }) => {
       setConversations(prev => prev.map(item => item.id === event.conversationId ? { ...item, unreadCount: 0 } : item));
       if (activeConversationRef.current === event.conversationId) setMessages([]);
     });
-    s.on('conversation:deleted', (event: { conversationId: string; deletedAt: string }) => {
-      setConversations(prev => prev.map(item => item.id !== event.conversationId ? item : {
-        ...item,
-        members: item.members.map(member => member.userId === user.id ? { ...member, deletedAt: event.deletedAt } : member)
-      }));
+    s.on('conversation:deleted', (event: { conversationId: string }) => {
+      setConversations(prev => prev.filter(item => item.id !== event.conversationId));
+      setRequests(prev => prev.filter(request => request.conversationId !== event.conversationId));
       if (activeConversationRef.current === event.conversationId) {
         setActive(null);
         setConversation('');
         setMessages([]);
         setSelectedRequest(null);
+        setChatMode('new');
       }
       setMoreOpen(false);
+      void loadRequests().catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh conversation requests'));
     });
     s.on('conversation:restored', () => {
       void loadConversations().catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh conversations'));
     });
     s.on('request:new', (event: { request: ConversationRequest }) => {
+      peerPublicKeysRef.current.delete(event.request.requesterId);
       void decryptConversationRequest(event.request).then(request => {
         setRequests(prev => [request, ...prev.filter(existing => existing.id !== request.id)]);
       }).catch(err => setError(err instanceof Error ? err.message : 'Unable to decrypt this conversation request'));
@@ -508,7 +615,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       }
     });
     s.on('block:update', () => {
-      void Promise.all([loadBlocks(), loadConversations(), loadPeople(searchRef.current)])
+      void Promise.all([loadBlocks(), loadConversations(), loadRequests(), loadPeople(searchRef.current)])
         .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh blocked users'));
     });
     return () => { s.disconnect(); setSocket(null); };
@@ -538,12 +645,15 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     setReactionPickerFor(null);
     setEmojiPickerOpen(false);
     setError('');
-    setConversations(prev => [{
-      id: conversationId,
-      unreadCount: 0,
-      members: [{ userId: user.id, user }, { userId: person.id, user: person }],
-      blocked: false
-    }, ...prev.filter(item => item.id !== conversationId)]);
+    setConversations(prev => {
+      const existing = prev.find(item => item.id === conversationId);
+      return [{
+        ...(existing || { blocked: false, blockedByMe: false, blockedMe: false }),
+        id: conversationId,
+        unreadCount: 0,
+        members: [{ userId: user.id, user }, { userId: person.id, user: person }]
+      }, ...prev.filter(item => item.id !== conversationId)];
+    });
     socket?.emit('conversation:join', { conversationId });
     if (prefetchedMessages) {
       if (prefetchedMessages.length) scrollToBottomRef.current = true;
@@ -714,7 +824,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
 
   async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft.trim() || !active || !conversation || !socket || isBlocked || !encryptionReady) return;
+    if (!draft.trim() || !active || !conversation || !socket || isBlockedByMe || !encryptionReady) return;
     const body = draft.trim(), clientMessageId = crypto.randomUUID();
     const peerId = active.id;
     let encryptedBody: string;
@@ -752,8 +862,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }
 
   const activeConversation = conversations.find(item => item.id === conversation);
-  const isBlockedByMe = active ? blocks.some(block => block.blocked.id === active.id) : false;
-  const isBlocked = Boolean(active && (isBlockedByMe || activeConversation?.blocked));
+  const isBlockedByMe = active ? blocks.some(block => block.blocked.id === active.id) || Boolean(activeConversation?.blockedByMe) : false;
+  const isBlockedByPeer = Boolean(active && activeConversation?.blockedMe);
+  const isBlocked = Boolean(active && (isBlockedByMe || isBlockedByPeer));
 
   async function clearChat() {
     if (!conversation || requestBusy) return;
@@ -778,18 +889,17 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     setRequestBusy(true);
     try {
       const response = await fetch(`${API}/api/conversations/${conversationId}`, { method: 'DELETE', headers: authHeaders() });
-      const data = await response.json() as { deletedAt?: string; error?: string };
-      if (!response.ok || !data.deletedAt) throw new Error(data.error || 'Unable to delete chat');
-      setConversations(prev => prev.map(item => item.id !== conversationId ? item : {
-        ...item,
-        members: item.members.map(member => member.userId === user.id ? { ...member, deletedAt: data.deletedAt } : member)
-      }));
+      const data = await response.json() as { error?: string };
+      if (!response.ok) throw new Error(data.error || 'Unable to delete chat');
+      setConversations(prev => prev.filter(item => item.id !== conversationId));
+      setRequests(prev => prev.filter(request => request.conversationId !== conversationId));
       setActive(null);
       setConversation('');
       setMessages([]);
       setSelectedRequest(null);
+      setChatMode('new');
       setMoreOpen(false);
-      setError('Chat deleted from your account.');
+      setError('Conversation deleted for both users. Send a new request to chat again.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to delete chat');
     } finally {
@@ -829,6 +939,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || (isBlockedByMe ? 'Unable to unblock user' : 'Unable to block user'));
+      if (isBlockedByMe) reflectUnblock(active.id);
       await Promise.all([loadBlocks(), loadConversations(), loadRequests(), loadPeople(search)]);
       setMoreOpen(false);
     } catch (err) {
@@ -843,10 +954,19 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       const response = await fetch(`${API}/api/blocks/${encodeURIComponent(person.id)}`, { method: 'DELETE', headers: authHeaders() });
       const data = await response.json() as { error?: string };
       if (!response.ok) throw new Error(data.error || 'Unable to unblock user');
+      reflectUnblock(person.id);
       await Promise.all([loadBlocks(), loadConversations(), loadPeople(search)]);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to unblock user');
     }
+  }
+
+  function reflectUnblock(personId: string) {
+    setBlocks(prev => prev.filter(block => block.blocked.id !== personId));
+    setConversations(prev => prev.map(item => {
+      if (!item.members.some(member => member.userId === personId)) return item;
+      return { ...item, blockedByMe: false, blocked: item.blockedMe };
+    }));
   }
 
   async function shareProfile() {
@@ -918,8 +1038,37 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     <main className={`layout ${active ? 'mobile-chat-open' : ''}`}>
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HeyBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
-        {!encryptionReady && !encryptionError && <div className="encryption-status" role="status">Setting up secure messaging…</div>}
+        {!encryptionReady && !encryptionError && !encryptionSetupMode && <div className="encryption-status" role="status">Setting up secure messaging…</div>}
         {encryptionError && <div className="encryption-warning" role="alert">{encryptionError}</div>}
+        {encryptionSetupMode && <form className="encryption-setup" onSubmit={event => void completeEncryptionSetup(event)}>
+          <strong>{encryptionSetupMode === 'unlock' ? 'Unlock account encryption' : 'Set up account encryption'}</strong>
+          <p>{encryptionSetupMode === 'unlock'
+            ? 'Enter your account passphrase to access encrypted messages on this device.'
+            : 'This passphrase protects your account key and lets you use secure messaging on other devices. Keep it safe; it cannot be reset.'}</p>
+          {legacyHistoryResetRequired && <label className="encryption-reset-confirm">
+            <input type="checkbox" checked={legacyHistoryResetConfirmed} onChange={event => setLegacyHistoryResetConfirmed(event.target.checked)}/>
+            <span>I understand my existing encrypted history will be permanently deleted.</span>
+          </label>}
+          <input
+            type="password"
+            autoComplete={encryptionSetupMode === 'unlock' ? 'current-password' : 'new-password'}
+            aria-label="Account encryption passphrase"
+            placeholder="Account passphrase"
+            value={encryptionPassphrase}
+            onChange={event => setEncryptionPassphrase(event.target.value)}
+          />
+          {encryptionSetupMode === 'setup' && <input
+            type="password"
+            autoComplete="new-password"
+            aria-label="Confirm account encryption passphrase"
+            placeholder="Confirm passphrase"
+            value={encryptionPassphraseConfirmation}
+            onChange={event => setEncryptionPassphraseConfirmation(event.target.value)}
+          />}
+          <button type="submit" disabled={encryptionWorking}>
+            {encryptionWorking ? 'Securing…' : encryptionSetupMode === 'unlock' ? 'Unlock' : 'Set up secure messaging'}
+          </button>
+        </form>}
         <div className="profile-row">
           <button type="button" className="avatar profile-avatar profile-avatar-trigger" style={{ backgroundColor: user.avatarColor || '#5524c8' }} aria-label="Edit profile" title="Edit profile" onClick={() => setProfileEditorOpen(true)}>
             {user.avatarData ? <img src={user.avatarData} alt=""/> : `${user.firstName?.trim().charAt(0) || ''}${user.lastName?.trim().charAt(0) || ''}`.toUpperCase() || user.username[0]?.toUpperCase()}
@@ -1018,7 +1167,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
           </> : <div className="chat-welcome"><MessageCircle size={19}/><span>Choose a contact to start chatting</span></div>}
         </header>
         {active && chatMode === 'chat' ? <>
-          {isBlocked && <div className="blocked-notice"><Ban size={17}/><span>{isBlockedByMe ? 'You blocked this user. Unblock them to send messages.' : 'This user has blocked messaging. You cannot send messages.'}</span></div>}
+          {isBlocked && <div className="blocked-notice"><Ban size={17}/><span>{isBlockedByMe
+            ? 'You blocked this user. Unblock them to resume messaging.'
+            : 'You are blocked by this user. Messages will be sent but not delivered unless they unblock you.'}</span></div>}
           <div className="messages" id="messages" ref={messagesContainerRef}>
             {messages.length > 0 && <div className="date-divider"><span>Conversation</span></div>}
             {messages.map(message => <div className={`bubble ${message.senderId === user.id ? 'mine' : 'theirs'}`} key={message.id}>
@@ -1054,13 +1205,13 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }}
-              placeholder={isBlocked ? 'Messaging is disabled' : 'Type a message…'}
+              placeholder={isBlockedByMe ? 'Unblock to send messages' : isBlockedByPeer ? 'Message will be delivered if unblocked' : 'Type a message…'}
               maxLength={4000}
               aria-label="Type a message"
               rows={1}
-              disabled={isBlocked}
+              disabled={isBlockedByMe}
             />
-            <button aria-label="Send message" disabled={!draft.trim() || isBlocked || !encryptionReady}><Send size={18}/><span>Send</span></button>
+            <button aria-label="Send message" disabled={!draft.trim() || isBlockedByMe || !encryptionReady}><Send size={18}/><span>Send</span></button>
           </form>
         </> : active && chatMode === 'incoming' && selectedRequest ? <div className="request-state">
           <div className="emptyicon"><MessageCircle size={38}/></div>

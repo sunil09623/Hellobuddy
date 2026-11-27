@@ -9,6 +9,7 @@ import nodemailer from 'nodemailer';
 import { Server } from 'socket.io';
 import { Prisma, PrismaClient } from '@prisma/client';
 import { z } from 'zod';
+import { decideMessageDelivery } from './messaging-policy.js';
 
 const prisma = new PrismaClient();
 const app = express();
@@ -18,12 +19,20 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: process.env.CLIENT_ORIGIN, credentials: true } });
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🎉', '🔥'] as const;
+const ENCRYPTED_MESSAGE_PREFIX = 'hb-e2ee:v1:';
 const ENCRYPTED_MESSAGE_SCHEMA = z.string().max(22_040).regex(/^hb-e2ee:v1:[A-Za-z0-9_-]{16}:[A-Za-z0-9_-]{22,22000}$/);
 const ENCRYPTION_PUBLIC_KEY_SCHEMA = z.object({
   kty: z.literal('EC'),
   crv: z.literal('P-256'),
   x: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
   y: z.string().regex(/^[A-Za-z0-9_-]{43}$/)
+}).strict();
+const WRAPPED_PRIVATE_KEY_SCHEMA = z.object({
+  version: z.literal(1),
+  iterations: z.number().int().min(100_000).max(1_000_000),
+  salt: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
+  iv: z.string().regex(/^[A-Za-z0-9_-]{16}$/),
+  ciphertext: z.string().regex(/^[A-Za-z0-9_-]{100,512}$/)
 }).strict();
 const PROFILE_SELECT = {
   id: true,
@@ -207,43 +216,105 @@ app.patch('/api/users/me/username', updateProfile);
 app.get('/api/users/me/encryption-key', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const [record] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
-    SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${user.id}
-  `;
-  if (!record) return res.status(404).json({ error: 'User not found' });
-  if (!record.encryptionPublicKey) return res.json({ publicKey: null });
   try {
+    const [record] = await prisma.$queryRaw<{
+      encryptionPublicKey: string | null;
+      encryptionPrivateKeyBackup: string | null;
+      encryptionKeyVersion: number;
+    }[]>`
+      SELECT "encryptionPublicKey", "encryptionPrivateKeyBackup", "encryptionKeyVersion"
+      FROM "User" WHERE "id" = ${user.id}
+    `;
+    if (!record) return res.status(404).json({ error: 'User not found' });
+    if (!record.encryptionPublicKey) return res.json({ publicKey: null, keyVersion: record.encryptionKeyVersion });
     const publicKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(record.encryptionPublicKey));
-    res.json({ publicKey });
+    const wrappedPrivateKey = record.encryptionPrivateKeyBackup
+      ? WRAPPED_PRIVATE_KEY_SCHEMA.parse(JSON.parse(record.encryptionPrivateKeyBackup))
+      : null;
+    res.json({ publicKey, wrappedPrivateKey, keyVersion: record.encryptionKeyVersion });
   } catch (error) {
-    console.error('Stored encryption public key is invalid', error);
+    console.error('Unable to load account encryption key', error);
     res.status(500).json({ error: 'Unable to load the encryption key' });
   }
 });
 app.put('/api/users/me/encryption-key', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const parsed = ENCRYPTION_PUBLIC_KEY_SCHEMA.safeParse(req.body?.publicKey);
-  if (!parsed.success) return res.status(400).json({ error: 'Invalid encryption public key' });
+  const parsed = z.object({
+    publicKey: ENCRYPTION_PUBLIC_KEY_SCHEMA,
+    wrappedPrivateKey: WRAPPED_PRIVATE_KEY_SCHEMA
+  }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid account encryption key' });
   try {
-    const encodedKey = JSON.stringify(parsed.data);
-    const [existing] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
-      SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${user.id}
-    `;
-    if (!existing) return res.status(404).json({ error: 'User not found' });
-    if (existing.encryptionPublicKey) {
-      const savedKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPublicKey));
-      const matches = savedKey.x === parsed.data.x && savedKey.y === parsed.data.y;
-      return matches
-        ? res.json({ publicKey: savedKey })
-        : res.status(409).json({ error: 'This account has an encryption key on another browser. Use the original browser to read encrypted messages.' });
+    const encodedKey = JSON.stringify(parsed.data.publicKey);
+    const encodedBackup = JSON.stringify(parsed.data.wrappedPrivateKey);
+    const outcome = await prisma.$transaction(async transaction => {
+      const [existing] = await transaction.$queryRaw<{
+        encryptionPublicKey: string | null;
+        encryptionPrivateKeyBackup: string | null;
+        encryptionKeyVersion: number;
+      }[]>`
+        SELECT "encryptionPublicKey", "encryptionPrivateKeyBackup", "encryptionKeyVersion"
+        FROM "User" WHERE "id" = ${user.id} FOR UPDATE
+      `;
+      if (!existing) return { status: 'missing' as const };
+      if (existing.encryptionPrivateKeyBackup) {
+        const savedKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPublicKey || 'null'));
+        const savedBackup = WRAPPED_PRIVATE_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPrivateKeyBackup));
+        const keyMatches = savedKey.x === parsed.data.publicKey.x && savedKey.y === parsed.data.publicKey.y;
+        const backupMatches = JSON.stringify(savedBackup) === encodedBackup;
+        return keyMatches && backupMatches
+          ? { status: 'saved' as const, keyVersion: existing.encryptionKeyVersion, peerIds: [] as string[] }
+          : { status: 'conflict' as const };
+      }
+
+      const peerIds = new Set<string>();
+      if (existing.encryptionPublicKey) {
+        const memberships = await transaction.conversationMember.findMany({
+          where: { userId: user.id },
+          select: { conversationId: true }
+        });
+        const peerMembers = await transaction.conversationMember.findMany({
+          where: { conversationId: { in: memberships.map(member => member.conversationId) }, userId: { not: user.id } },
+          select: { userId: true }
+        });
+        peerMembers.forEach(member => peerIds.add(member.userId));
+        const relatedRequests = await transaction.conversationRequest.findMany({
+          where: { OR: [{ requesterId: user.id }, { recipientId: user.id }] },
+          select: { requesterId: true, recipientId: true }
+        });
+        relatedRequests.forEach(request => peerIds.add(request.requesterId === user.id ? request.recipientId : request.requesterId));
+      }
+
+      await transaction.message.deleteMany({
+        where: {
+          body: { startsWith: ENCRYPTED_MESSAGE_PREFIX },
+          conversation: { members: { some: { userId: user.id } } }
+        }
+      });
+      await transaction.conversationRequest.deleteMany({
+        where: {
+          initialMessage: { startsWith: ENCRYPTED_MESSAGE_PREFIX },
+          OR: [{ requesterId: user.id }, { recipientId: user.id }]
+        }
+      });
+
+      const keyVersion = existing.encryptionPublicKey ? existing.encryptionKeyVersion + 1 : existing.encryptionKeyVersion;
+      await transaction.$executeRaw`
+        UPDATE "User"
+        SET "encryptionPublicKey" = ${encodedKey},
+            "encryptionPrivateKeyBackup" = ${encodedBackup},
+            "encryptionKeyVersion" = ${keyVersion}
+        WHERE "id" = ${user.id}
+      `;
+      return { status: 'saved' as const, keyVersion, peerIds: [...peerIds] };
+    });
+    if (outcome.status === 'missing') return res.status(404).json({ error: 'User not found' });
+    if (outcome.status === 'conflict') return res.status(409).json({ error: 'An account encryption key is already configured and cannot be replaced.' });
+    for (const peerId of new Set([...outcome.peerIds, user.id])) {
+      io.to(`user:${peerId}`).emit('encryption:key:update', { userId: user.id, keyVersion: outcome.keyVersion });
     }
-    const updated = await prisma.$executeRaw`
-      UPDATE "User" SET "encryptionPublicKey" = ${encodedKey}
-      WHERE "id" = ${user.id} AND "encryptionPublicKey" IS NULL
-    `;
-    if (!updated) return res.status(409).json({ error: 'An encryption key was registered for this account in another browser. Use the original browser.' });
-    res.json({ publicKey: parsed.data });
+    res.json({ publicKey: parsed.data.publicKey, keyVersion: outcome.keyVersion });
   } catch (error) {
     console.error('Unable to register encryption public key', error);
     res.status(500).json({ error: 'Unable to register the encryption key' });
@@ -252,16 +323,17 @@ app.put('/api/users/me/encryption-key', async (req, res) => {
 app.get('/api/users/:id/encryption-key', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const [target] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
-    SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${req.params.id}
-  `;
-  if (!target) return res.status(404).json({ error: 'User not found' });
-  if (!target.encryptionPublicKey) return res.status(409).json({ error: 'This contact has not initialized secure messaging yet. Ask them to sign in again.' });
   try {
+    const [target] = await prisma.$queryRaw<{ encryptionPublicKey: string | null; encryptionKeyVersion: number }[]>`
+      SELECT "encryptionPublicKey", "encryptionKeyVersion"
+      FROM "User" WHERE "id" = ${req.params.id}
+    `;
+    if (!target) return res.status(404).json({ error: 'User not found' });
+    if (!target.encryptionPublicKey) return res.status(409).json({ error: 'This contact has not initialized secure messaging yet. Ask them to sign in again.' });
     const publicKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(target.encryptionPublicKey));
-    res.json({ publicKey });
+    res.json({ publicKey, keyVersion: target.encryptionKeyVersion });
   } catch (error) {
-    console.error('Stored encryption public key is invalid', error);
+    console.error('Unable to load contact encryption key', error);
     res.status(500).json({ error: 'Unable to load the contact encryption key' });
   }
 });
@@ -283,42 +355,47 @@ app.get('/api/public/users/:username', async (req, res) => {
 app.get('/api/users', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const q = String(req.query.q || '').slice(0, 50);
-  const phoneDigits = /^[+\d().\-\s]+$/.test(q) ? q.replace(/\D/g, '') : '';
-  const [users, phoneMatches, blocks, memberships] = await Promise.all([
-    prisma.user.findMany({
-      where: {
-        id: { not: user.id },
-        OR: [
-          { username: { contains: q, mode: 'insensitive' } },
-          { email: { contains: q, mode: 'insensitive' } }
-        ]
-      },
-      select: { id: true, username: true },
-      take: 50
-    }),
-    phoneDigits.length >= 3
-      ? prisma.$queryRaw<{ id: string; username: string }[]>`
-          SELECT "id", "username"
-          FROM "User"
-          WHERE "id" <> ${user.id}
-            AND "phoneNumber" IS NOT NULL
-            AND regexp_replace("phoneNumber", '[^0-9]', '', 'g') LIKE ${`%${phoneDigits}%`}
-          ORDER BY "username"
-          LIMIT 50
-        `
-      : Promise.resolve([]),
-    prisma.userBlock.findMany({ where: { OR: [{ blockerId: user.id }, { blockedId: user.id }] } }),
-    prisma.conversationMember.findMany({ where: { userId: user.id, deletedAt: null }, select: { conversationId: true } })
-  ]);
-  const otherMemberIds = await prisma.conversationMember.findMany({
-    where: { conversationId: { in: memberships.map(member => member.conversationId) }, userId: { not: user.id } },
-    select: { userId: true }
-  });
-  const existingContacts = new Set(otherMemberIds.map(member => member.userId));
-  const blockedContacts = new Set(blocks.map(block => block.blockerId === user.id ? block.blockedId : block.blockerId));
-  const matches = new Map([...users, ...phoneMatches].map(person => [person.id, person]));
-  res.json([...matches.values()].filter(person => !blockedContacts.has(person.id) || existingContacts.has(person.id)).slice(0, 30));
+  try {
+    const q = String(req.query.q || '').slice(0, 50);
+    const phoneDigits = /^[+\d().\-\s]+$/.test(q) ? q.replace(/\D/g, '') : '';
+    const [users, phoneMatches, blocks, memberships] = await Promise.all([
+      prisma.user.findMany({
+        where: {
+          id: { not: user.id },
+          OR: [
+            { username: { contains: q, mode: 'insensitive' } },
+            { email: { contains: q, mode: 'insensitive' } }
+          ]
+        },
+        select: { id: true, username: true },
+        take: 50
+      }),
+      phoneDigits.length >= 3
+        ? prisma.$queryRaw<{ id: string; username: string }[]>`
+            SELECT "id", "username"
+            FROM "User"
+            WHERE "id" <> ${user.id}
+              AND "phoneNumber" IS NOT NULL
+              AND regexp_replace("phoneNumber", '[^0-9]', '', 'g') LIKE ${`%${phoneDigits}%`}
+            ORDER BY "username"
+            LIMIT 50
+          `
+        : Promise.resolve([]),
+      prisma.userBlock.findMany({ where: { OR: [{ blockerId: user.id }, { blockedId: user.id }] } }),
+      prisma.conversationMember.findMany({ where: { userId: user.id, deletedAt: null }, select: { conversationId: true } })
+    ]);
+    const otherMemberIds = await prisma.conversationMember.findMany({
+      where: { conversationId: { in: memberships.map(member => member.conversationId) }, userId: { not: user.id } },
+      select: { userId: true }
+    });
+    const existingContacts = new Set(otherMemberIds.map(member => member.userId));
+    const blockedContacts = new Set(blocks.map(block => block.blockerId === user.id ? block.blockedId : block.blockerId));
+    const matches = new Map([...users, ...phoneMatches].map(person => [person.id, person]));
+    res.json([...matches.values()].filter(person => !blockedContacts.has(person.id) || existingContacts.has(person.id)).slice(0, 30));
+  } catch (error) {
+    console.error('Unable to search users', error);
+    res.status(500).json({ error: 'Unable to search users' });
+  }
 });
 app.post('/api/conversations', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
@@ -342,26 +419,33 @@ app.get('/api/conversations', async (req, res) => {
     orderBy: { createdAt: 'desc' }
   });
   const otherIds = convos.flatMap(convo => convo.members.filter(member => member.userId !== user.id).map(member => member.userId));
-  const [blocks, unreadCounts] = await Promise.all([
-    prisma.userBlock.findMany({ where: { OR: [{ blockerId: user.id, blockedId: { in: otherIds } }, { blockedId: user.id, blockerId: { in: otherIds } }] } }),
-    Promise.all(convos.map(convo => {
-      const currentMember = convo.members.find(member => member.userId === user.id);
-      return prisma.message.count({
-        where: {
-          conversationId: convo.id,
-          senderId: { not: user.id },
-          receipts: { some: { userId: user.id, readAt: null } },
-          ...(currentMember?.clearedAt ? { createdAt: { gt: currentMember.clearedAt } } : {})
-        }
-      });
-    }))
-  ]);
-  const blockedIds = new Set(blocks.map(block => block.blockerId === user.id ? block.blockedId : block.blockerId));
+  const blocks = await prisma.userBlock.findMany({
+    where: { OR: [{ blockerId: user.id, blockedId: { in: otherIds } }, { blockedId: user.id, blockerId: { in: otherIds } }] }
+  });
+  const unreadCounts = await Promise.all(convos.map(convo => {
+    const currentMember = convo.members.find(member => member.userId === user.id);
+    const peerIds = convo.members.filter(member => member.userId !== user.id).map(member => member.userId);
+    const blockedByMeIds = blocks.filter(block => block.blockerId === user.id && peerIds.includes(block.blockedId)).map(block => block.blockedId);
+    return prisma.message.count({
+      where: {
+        conversationId: convo.id,
+        senderId: { not: user.id },
+        receipts: { some: { userId: user.id, readAt: null } },
+        OR: [
+          { senderId: { notIn: blockedByMeIds } },
+          { receipts: { some: { userId: user.id, deliveredAt: { not: null }, readAt: null } } }
+        ],
+        ...(currentMember?.clearedAt ? { createdAt: { gt: currentMember.clearedAt } } : {})
+      }
+    });
+  }));
   res.json(convos.map((convo, index) => ({
     ...convo,
     unreadCount: unreadCounts[index],
     members: convo.members.map(member => member.userId === user.id ? member : { ...member, clearedAt: null, deletedAt: null }),
-    blocked: convo.members.some(member => blockedIds.has(member.userId) && member.userId !== user.id)
+    blockedByMe: blocks.some(block => block.blockerId === user.id && convo.members.some(member => member.userId === block.blockedId)),
+    blockedMe: blocks.some(block => block.blockedId === user.id && convo.members.some(member => member.userId === block.blockerId)),
+    blocked: blocks.some(block => convo.members.some(member => member.userId !== user.id && (member.userId === block.blockedId || member.userId === block.blockerId)))
   })));
 });
 app.post('/api/conversations/:id/restore', async (req, res) => {
@@ -387,13 +471,32 @@ app.delete('/api/conversations/:id/messages', async (req, res) => {
 });
 app.delete('/api/conversations/:id', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const where = { conversationId_userId: { conversationId: req.params.id, userId: user.id } };
-  const member = await prisma.conversationMember.findUnique({ where, select: { conversationId: true } });
-  if (!member) return res.status(403).json({ error: 'Forbidden' });
-  const deletedAt = new Date();
-  await prisma.conversationMember.update({ where, data: { deletedAt } });
-  io.to(`user:${user.id}`).emit('conversation:deleted', { conversationId: req.params.id, deletedAt: deletedAt.toISOString() });
-  res.json({ ok: true, deletedAt: deletedAt.toISOString() });
+  try {
+    const conversation = await prisma.conversation.findUnique({
+      where: { id: req.params.id },
+      include: { members: { select: { userId: true } } }
+    });
+    if (!conversation || !conversation.members.some(member => member.userId === user.id)) return res.status(403).json({ error: 'Forbidden' });
+    const otherIds = conversation.members.filter(member => member.userId !== user.id).map(member => member.userId);
+    await prisma.$transaction(async transaction => {
+      await transaction.conversationRequest.deleteMany({
+        where: {
+          OR: otherIds.flatMap(otherId => [
+            { requesterId: user.id, recipientId: otherId },
+            { requesterId: otherId, recipientId: user.id }
+          ])
+        }
+      });
+      await transaction.conversation.delete({ where: { id: conversation.id } });
+    });
+    for (const member of conversation.members) {
+      io.to(`user:${member.userId}`).emit('conversation:deleted', { conversationId: conversation.id });
+    }
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Unable to delete conversation', error);
+    res.status(500).json({ error: 'Unable to delete conversation' });
+  }
 });
 app.get('/api/conversation-requests', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
@@ -573,18 +676,83 @@ app.post('/api/blocks', async (req, res) => {
 });
 app.delete('/api/blocks/:userId', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  await prisma.userBlock.deleteMany({ where: { blockerId: user.id, blockedId: req.params.userId } });
-  io.to(`user:${req.params.userId}`).emit('block:update', { userId: user.id, blocked: false });
-  io.to(`user:${user.id}`).emit('block:update', { userId: req.params.userId, blocked: false });
-  res.json({ ok: true });
+  try {
+    const targetId = req.params.userId;
+    const delivery = await prisma.$transaction(async transaction => {
+      await transaction.userBlock.deleteMany({ where: { blockerId: user.id, blockedId: targetId } });
+      const remainingBlock = await transaction.userBlock.findFirst({
+        where: { OR: [{ blockerId: user.id, blockedId: targetId }, { blockerId: targetId, blockedId: user.id }] }
+      });
+      if (remainingBlock) return { pendingMessages: [], deliveredAt: new Date() };
+      const pendingMessages = await transaction.message.findMany({
+        where: {
+          senderId: targetId,
+          conversation: {
+            AND: [
+              { members: { some: { userId: user.id } } },
+              { members: { some: { userId: targetId } } }
+            ]
+          },
+          receipts: { some: { userId: user.id, deliveredAt: null } }
+        },
+        include: { receipts: true },
+        orderBy: [{ createdAt: 'asc' }, { id: 'asc' }]
+      });
+      if (pendingMessages.length) {
+        const deliveredAt = new Date();
+        await transaction.messageReceipt.updateMany({
+          where: { messageId: { in: pendingMessages.map(message => message.id) }, userId: user.id, deliveredAt: null },
+          data: { deliveredAt }
+        });
+        return { pendingMessages, deliveredAt };
+      }
+      return { pendingMessages, deliveredAt: new Date() };
+    });
+    for (const message of delivery.pendingMessages) {
+      const update = {
+        messageId: message.id,
+        conversationId: message.conversationId,
+        userId: user.id,
+        deliveredAt: delivery.deliveredAt.toISOString(),
+        readAt: null
+      };
+      const deliveredMessage = {
+        ...message,
+        receipts: message.receipts.map(receipt => receipt.userId === user.id ? { ...receipt, deliveredAt: delivery.deliveredAt } : receipt)
+      };
+      io.to(`user:${user.id}`).emit('message:new', deliveredMessage);
+      io.to(`user:${targetId}`).emit('receipt:update', update);
+    }
+    io.to(`user:${targetId}`).emit('block:update', { userId: user.id, blocked: false });
+    io.to(`user:${user.id}`).emit('block:update', { userId: targetId, blocked: false });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Unable to unblock user', error);
+    res.status(500).json({ error: 'Unable to unblock user' });
+  }
 });
 app.get('/api/conversations/:id/messages', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
   const convoId = req.params.id; const allowed = await prisma.conversationMember.findUnique({ where: { conversationId_userId: { conversationId: convoId, userId: user.id } } }); if (!allowed || allowed.deletedAt) return res.status(403).json({ error: 'Forbidden' });
   const before = req.query.before ? new Date(String(req.query.before)) : undefined; const take = Math.min(Number(req.query.limit || 40), 100);
   const dateFilter = { ...(before ? { lt: before } : {}), ...(allowed.clearedAt ? { gt: allowed.clearedAt } : {}) };
+  const peerMembers = await prisma.conversationMember.findMany({
+    where: { conversationId: convoId, userId: { not: user.id } },
+    select: { userId: true }
+  });
+  const blockedSenders = await prisma.userBlock.findMany({
+    where: { blockerId: user.id, blockedId: { in: peerMembers.map(member => member.userId) } },
+    select: { blockedId: true }
+  });
   const messages = await prisma.message.findMany({
-    where: { conversationId: convoId, ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}) },
+    where: {
+      conversationId: convoId,
+      ...(Object.keys(dateFilter).length ? { createdAt: dateFilter } : {}),
+      OR: [
+        { senderId: { notIn: blockedSenders.map(block => block.blockedId) } },
+        { receipts: { some: { userId: user.id, deliveredAt: { not: null } } } }
+      ]
+    },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take,
     include: { receipts: true, reactions: { select: { emoji: true, userId: true } } }
@@ -603,9 +771,17 @@ io.on('connection', socket => {
     try {
       const members = await prisma.conversationMember.findMany({ where: { conversationId: data.data.conversationId } });
       const peerIds = members.filter(member => member.userId !== user.id).map(member => member.userId);
-      const block = await prisma.userBlock.findFirst({ where: { OR: [{ blockerId: user.id, blockedId: { in: peerIds } }, { blockedId: user.id, blockerId: { in: peerIds } }] } });
-      if (block) return ack?.({ ok: false, error: 'Messaging is unavailable for this contact' });
+      const blocks = await prisma.userBlock.findMany({
+        where: { OR: [{ blockerId: user.id, blockedId: { in: peerIds } }, { blockedId: user.id, blockerId: { in: peerIds } }] }
+      });
+      const deliveryPolicy = decideMessageDelivery(user.id, peerIds, blocks);
+      if (deliveryPolicy === 'reject') return ack?.({ ok: false, error: 'Messaging is unavailable for this contact' });
+      const queuedForUnblock = deliveryPolicy === 'queue';
       const message = await prisma.message.upsert({ where: { senderId_clientMessageId: { senderId: user.id, clientMessageId: data.data.clientMessageId } }, update: {}, create: { clientMessageId: data.data.clientMessageId, conversationId: data.data.conversationId, senderId: user.id, body: data.data.body, receipts: { create: peerIds.map(userId => ({ userId })) } }, include: { receipts: true } });
+      if (queuedForUnblock) {
+        ack?.({ ok: true, message });
+        return;
+      }
       const restored = await prisma.conversationMember.updateMany({
         where: { conversationId: message.conversationId, deletedAt: { not: null } },
         data: { deletedAt: null }
@@ -627,9 +803,13 @@ io.on('connection', socket => {
     try {
       const message = await prisma.message.findFirst({
         where: { id: data.data.messageId, conversation: { members: { some: { userId: user.id } } } },
-        select: { id: true, conversationId: true, createdAt: true }
+        select: { id: true, conversationId: true, createdAt: true, senderId: true }
       });
       if (!message) return ack?.({ ok: false, error: 'Message not found' });
+      const block = await prisma.userBlock.findFirst({
+        where: { OR: [{ blockerId: user.id, blockedId: message.senderId }, { blockerId: message.senderId, blockedId: user.id }] }
+      });
+      if (block) return ack?.({ ok: false, error: 'Reactions are unavailable while this user is blocked.' });
       const member = await prisma.conversationMember.findUnique({
         where: { conversationId_userId: { conversationId: message.conversationId, userId: user.id } },
         select: { clearedAt: true, deletedAt: true }
@@ -665,6 +845,15 @@ io.on('connection', socket => {
     const data = z.object({ messageId: z.string().min(1) }).safeParse(payload);
     if (!data.success) return;
     try {
+      const existingReceipt = await prisma.messageReceipt.findUnique({
+        where: { messageId_userId: { messageId: data.data.messageId, userId: user.id } },
+        include: { message: { select: { senderId: true } } }
+      });
+      if (!existingReceipt) return;
+      const block = await prisma.userBlock.findUnique({
+        where: { blockerId_blockedId: { blockerId: user.id, blockedId: existingReceipt.message.senderId } }
+      });
+      if (block && !existingReceipt.deliveredAt) return;
       const receipt = await prisma.messageReceipt.update({
         where: { messageId_userId: { messageId: data.data.messageId, userId: user.id }, deliveredAt: null },
         data: { deliveredAt: new Date() },
@@ -682,12 +871,18 @@ io.on('connection', socket => {
     const parsed = z.object({ messageIds: z.array(z.string().min(1)).max(100) }).safeParse(payload);
     if (!parsed.success) return;
     try {
+      const blocks = await prisma.userBlock.findMany({ where: { blockerId: user.id }, select: { blockedId: true } });
+      const blockedSenderIds = blocks.map(block => block.blockedId);
       const messages = await prisma.message.findMany({
         where: {
           id: { in: parsed.data.messageIds },
           senderId: { not: user.id },
           conversation: { members: { some: { userId: user.id } } },
-          receipts: { some: { userId: user.id, readAt: null } }
+          receipts: { some: { userId: user.id, readAt: null } },
+          OR: [
+            { senderId: { notIn: blockedSenderIds } },
+            { receipts: { some: { userId: user.id, deliveredAt: { not: null }, readAt: null } } }
+          ]
         },
         select: { id: true, senderId: true, conversationId: true }
       });
