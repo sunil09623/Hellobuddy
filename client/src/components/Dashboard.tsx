@@ -64,7 +64,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const recentIncomingRequestIdsRef = useRef(new Set<string>());
   const notificationsEnabledRef = useRef(notificationsEnabled);
   const notificationTimerRef = useRef<number | null>(null);
-  const notificationAudioRef = useRef<AudioContext | null>(null);
+  const notificationAudioRef = useRef<HTMLAudioElement | null>(null);
+  const notificationAudioPrimingRef = useRef(false);
+  const notificationAudioPrimedRef = useRef(false);
   const selectedRequestRef = useRef<ConversationRequest | null>(null);
   const searchRef = useRef(search);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -109,35 +111,43 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     setPeople(data);
   }, [token]);
 
+  function getNotificationAudio() {
+    if (!notificationAudioRef.current) {
+      const audio = new Audio(new URL('/notification-bell.wav', window.location.href).toString());
+      audio.preload = 'auto';
+      notificationAudioRef.current = audio;
+    }
+    return notificationAudioRef.current;
+  }
+
+  function prepareNotificationAudio() {
+    if (notificationAudioPrimedRef.current || notificationAudioPrimingRef.current) return;
+    const audio = getNotificationAudio();
+    audio.muted = true;
+    audio.currentTime = 0;
+    notificationAudioPrimingRef.current = true;
+    void audio.play().then(() => {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.muted = false;
+      notificationAudioPrimedRef.current = true;
+      notificationAudioPrimingRef.current = false;
+    }).catch(() => {
+      audio.pause();
+      audio.muted = false;
+      notificationAudioPrimingRef.current = false;
+      if (notificationsEnabledRef.current) setError('Could not prepare the notification sound. Check your browser audio settings.');
+    });
+  }
+
   function playNotificationSound() {
-    if (typeof window.AudioContext === 'undefined') {
-      setError('Notification sound is not supported by this browser.');
-      return;
-    }
-    const context = notificationAudioRef.current ?? new window.AudioContext();
-    notificationAudioRef.current = context;
-    const playTone = () => {
-      const start = context.currentTime;
-      const oscillator = context.createOscillator();
-      const volume = context.createGain();
-      oscillator.type = 'sine';
-      oscillator.frequency.setValueAtTime(880, start);
-      volume.gain.setValueAtTime(0.0001, start);
-      volume.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
-      volume.gain.exponentialRampToValueAtTime(0.0001, start + 0.24);
-      oscillator.connect(volume);
-      volume.connect(context.destination);
-      oscillator.start(start);
-      oscillator.stop(start + 0.25);
-    };
-    if (context.state === 'running') {
-      playTone();
-    } else {
-      void context.resume().then(() => {
-        if (context.state === 'running') playTone();
-        else setError('Notification sound could not be enabled. Check your browser audio settings.');
-      }).catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
-    }
+    const audio = getNotificationAudio();
+    audio.pause();
+    audio.currentTime = 0;
+    audio.muted = false;
+    void audio.play().catch(() => {
+      if (notificationsEnabledRef.current) setError('Could not play the notification sound. Check your browser audio settings.');
+    });
   }
 
   function showNotification(message: string) {
@@ -161,13 +171,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       setError('Unable to save your notification preference in this browser.');
     }
     if (next) {
-      if (typeof window.AudioContext !== 'undefined') {
-        const context = notificationAudioRef.current ?? new window.AudioContext();
-        notificationAudioRef.current = context;
-        if (context.state === 'suspended') {
-          void context.resume().catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
-        }
-      }
+      prepareNotificationAudio();
     } else {
       setNotification('');
       if (notificationTimerRef.current !== null) {
@@ -195,13 +199,11 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
 
   useEffect(() => {
     if (!notificationsEnabled) return;
+    getNotificationAudio().load();
     const prepareAudioOnInteraction = () => {
-      if (notificationAudioRef.current || typeof window.AudioContext === 'undefined') return;
-      const context = new window.AudioContext();
-      notificationAudioRef.current = context;
+      prepareNotificationAudio();
       document.removeEventListener('pointerdown', prepareAudioOnInteraction);
       document.removeEventListener('keydown', prepareAudioOnInteraction);
-      void context.resume().catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
     };
     document.addEventListener('pointerdown', prepareAudioOnInteraction);
     document.addEventListener('keydown', prepareAudioOnInteraction);
