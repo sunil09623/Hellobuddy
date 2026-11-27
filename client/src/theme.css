@@ -320,6 +320,20 @@ button {
   white-space: nowrap;
 }
 
+.person-unread-badge {
+  display: grid;
+  min-width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  place-items: center;
+  padding: 0 6px;
+  border-radius: 11px;
+  color: #fff;
+  background: #5b2bd6;
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .person-arrow {
   display: grid;
   place-items: center;
@@ -855,6 +869,28 @@ button {
   border-color: #e0e2ec;
   border-radius: 13px;
   background: #fff;
+}
+
+.composer textarea {
+  flex: 1;
+  width: 100%;
+  min-width: 0;
+  min-height: 46px;
+  max-height: 160px;
+  padding: 12px 16px;
+  border: 1px solid #e0e2ec;
+  border-radius: 13px;
+  outline: none;
+  background: #fff;
+  font: inherit;
+  line-height: 1.4;
+  resize: none;
+  overflow-y: hidden;
+}
+
+.composer textarea:focus {
+  border-color: #7a58e5;
+  box-shadow: 0 0 0 3px #7a58e51b;
 }
 
 .composer .emoji-toggle,

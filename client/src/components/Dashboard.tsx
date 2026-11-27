@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { io, type Socket } from 'socket.io-client';
 import { ArrowLeft, Ban, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
 import { API } from '../config';
@@ -8,8 +8,8 @@ import { ProfileEditor } from './ProfileEditor';
 type Receipt = { userId: string; deliveredAt: string | null; readAt: string | null };
 type Reaction = { emoji: string; count: number; reactedByMe: boolean };
 type Message = { id: string; clientMessageId: string; conversationId: string; senderId: string; body: string; createdAt: string; receipts?: Receipt[]; reactions?: Reaction[] };
-type ReceiptUpdate = { messageId: string; userId: string; deliveredAt: string | null; readAt: string | null };
-type Conversation = { id: string; members: { userId: string; user: User; clearedAt?: string | null; deletedAt?: string | null }[]; blocked: boolean };
+type ReceiptUpdate = { messageId: string; conversationId: string; userId: string; deliveredAt: string | null; readAt: string | null };
+type Conversation = { id: string; unreadCount: number; members: { userId: string; user: User; clearedAt?: string | null; deletedAt?: string | null }[]; blocked: boolean };
 type ConversationRequest = {
   id: string;
   requesterId: string;
@@ -57,11 +57,15 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [requestBusy, setRequestBusy] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const activeConversationRef = useRef('');
+  const recentIncomingMessageIdsRef = useRef(new Set<string>());
   const selectedRequestRef = useRef<ConversationRequest | null>(null);
   const searchRef = useRef(search);
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const scrollToBottomAfterSendRef = useRef(false);
   const draftInputRef = useRef<HTMLInputElement>(null);
+  const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
   const profileShareInputRef = useRef<HTMLInputElement>(null);
   const emojiPickerRef = useRef<HTMLDivElement>(null);
   const reactionPickerRef = useRef<HTMLDivElement>(null);
@@ -109,6 +113,22 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   useEffect(() => {
     searchRef.current = search;
   }, [search]);
+
+  useLayoutEffect(() => {
+    if (!scrollToBottomAfterSendRef.current) return;
+    scrollToBottomAfterSendRef.current = false;
+    const container = messagesContainerRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+  }, [messages]);
+
+  useLayoutEffect(() => {
+    const textarea = draftTextareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = 'auto';
+    const maxHeight = 160;
+    textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+  }, [draft]);
 
   useEffect(() => {
     if (!moreOpen) return;
@@ -172,29 +192,54 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     s.on('connect_error', () => setError('Live connection interrupted. Retrying automatically…'));
     s.on('connect', () => setError(''));
     s.on('message:new', (message: Message) => {
-      if (message.senderId !== user.id) s.emit('receipt:delivered', { messageId: message.id });
+      if (message.senderId !== user.id) {
+        s.emit('receipt:delivered', { messageId: message.id });
+        const recentMessageIds = recentIncomingMessageIdsRef.current;
+        const isNewMessage = !recentMessageIds.has(message.id);
+        if (isNewMessage) {
+          recentMessageIds.add(message.id);
+          if (recentMessageIds.size > 500) {
+            const oldestMessageId = recentMessageIds.values().next().value;
+            if (oldestMessageId !== undefined) recentMessageIds.delete(oldestMessageId);
+          }
+        }
+        const conversationIsVisible = message.conversationId === activeConversationRef.current && document.visibilityState === 'visible';
+        if (isNewMessage && !conversationIsVisible) {
+          setConversations(prev => prev.map(item => item.id === message.conversationId
+            ? { ...item, unreadCount: item.unreadCount + 1 }
+            : item));
+        }
+      }
       if (message.conversationId !== activeConversationRef.current) return;
       setMessages(prev => prev.some(item => item.id === message.id || item.clientMessageId === message.clientMessageId)
         ? prev
         : [...prev, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
     });
-    s.on('receipt:update', (update: ReceiptUpdate) => setMessages(prev => prev.map(item => {
-      if (item.id !== update.messageId) return item;
-      const receipts = item.receipts || [];
-      const hasReceipt = receipts.some(receipt => receipt.userId === update.userId);
-      return {
-        ...item,
-        receipts: hasReceipt
-          ? receipts.map(receipt => receipt.userId === update.userId ? { ...receipt, deliveredAt: update.deliveredAt, readAt: update.readAt } : receipt)
-          : [...receipts, { userId: update.userId, deliveredAt: update.deliveredAt, readAt: update.readAt }]
-      };
-    })));
+    s.on('receipt:update', (update: ReceiptUpdate) => {
+      if (update.userId === user.id && update.readAt) {
+        setConversations(prev => prev.map(item => item.id === update.conversationId
+          ? { ...item, unreadCount: Math.max(0, item.unreadCount - 1) }
+          : item));
+      }
+      setMessages(prev => prev.map(item => {
+        if (item.id !== update.messageId) return item;
+        const receipts = item.receipts || [];
+        const hasReceipt = receipts.some(receipt => receipt.userId === update.userId);
+        return {
+          ...item,
+          receipts: hasReceipt
+            ? receipts.map(receipt => receipt.userId === update.userId ? { ...receipt, deliveredAt: update.deliveredAt, readAt: update.readAt } : receipt)
+            : [...receipts, { userId: update.userId, deliveredAt: update.deliveredAt, readAt: update.readAt }]
+        };
+      }));
+    });
     s.on('reaction:update', (update: { messageId: string; reactions: Reaction[] }) => {
       setMessages(prev => prev.map(message => message.id === update.messageId
         ? { ...message, reactions: update.reactions }
         : message));
     });
     s.on('conversation:cleared', (event: { conversationId: string }) => {
+      setConversations(prev => prev.map(item => item.id === event.conversationId ? { ...item, unreadCount: 0 } : item));
       if (activeConversationRef.current === event.conversationId) setMessages([]);
     });
     s.on('conversation:deleted', (event: { conversationId: string; deletedAt: string }) => {
@@ -266,6 +311,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     setError('');
     setConversations(prev => [{
       id: conversationId,
+      unreadCount: 0,
       members: [{ userId: user.id, user }, { userId: person.id, user: person }],
       blocked: false
     }, ...prev.filter(item => item.id !== conversationId)]);
@@ -425,6 +471,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     if (!draft.trim() || !active || !conversation || !socket || isBlocked) return;
     const body = draft.trim(), clientMessageId = crypto.randomUUID();
     const optimistic: Message = { id: `temp-${clientMessageId}`, clientMessageId, conversationId: conversation, senderId: user.id, body, createdAt: new Date().toISOString() };
+    scrollToBottomAfterSendRef.current = true;
     setMessages(prev => [...prev, optimistic]); setDraft('');
     socket.emit('message:send', { clientMessageId, conversationId: conversation, body }, (ack: { ok: boolean; message?: Message; error?: string }) => {
       if (ack.ok && ack.message) setMessages(prev => prev.map(message => message.clientMessageId === clientMessageId ? ack.message! : message));
@@ -485,7 +532,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }
 
   function insertEmoji(emoji: string) {
-    const input = draftInputRef.current;
+    const input = draftTextareaRef.current ?? draftInputRef.current;
     const start = input?.selectionStart ?? draft.length;
     const end = input?.selectionEnd ?? start;
     if (draft.length - (end - start) + emoji.length > 4000) return;
@@ -629,11 +676,16 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
           </label>
           <div className="contacts-heading"><span>Contacts</span><span className="contact-count">{visibleContacts.length}</span></div>
           <div className="people">
-            {visibleContacts.map((person, index) => <button className={`person ${active?.id === person.id ? 'selected' : ''}`} key={person.id} onClick={() => void openChat(person)}>
-              <div className={`avatar avatar-tone-${index % 4}`}>{person.username[0]?.toUpperCase()}</div>
-              <div className="person-text"><strong>{person.username}</strong><small>{conversations.some(item => item.members.some(member => member.userId === person.id)) ? 'Open conversation' : 'Start a conversation'}</small></div>
-              <span className="person-arrow"><MessageCircle size={16}/></span>
-            </button>)}
+            {visibleContacts.map((person, index) => {
+              const personConversation = conversations.find(item => item.members.some(member => member.userId === person.id));
+              const unreadCount = personConversation?.unreadCount || 0;
+              return <button className={`person ${active?.id === person.id ? 'selected' : ''}`} key={person.id} onClick={() => void openChat(person)}>
+                <div className={`avatar avatar-tone-${index % 4}`}>{person.username[0]?.toUpperCase()}</div>
+                <div className="person-text"><strong>{person.username}</strong><small>{personConversation ? 'Open conversation' : 'Start a conversation'}</small></div>
+                {unreadCount > 0 && <span className="person-unread-badge" aria-label={`${unreadCount} unread messages`}>{unreadCount > 99 ? '99+' : unreadCount}</span>}
+                <span className="person-arrow"><MessageCircle size={16}/></span>
+              </button>;
+            })}
             {!visibleContacts.length && <div className="no-people">{search ? 'No contacts match your search.' : 'Chats and sent requests will appear here. Search for someone to start a conversation.'}</div>}
           </div>
         </> : sidebarView === 'requests' ? <div className="sidebar-list">
@@ -690,7 +742,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         </header>
         {active && chatMode === 'chat' ? <>
           {isBlocked && <div className="blocked-notice"><Ban size={17}/><span>{isBlockedByMe ? 'You blocked this user. Unblock them to send messages.' : 'This user has blocked messaging. You cannot send messages.'}</span></div>}
-          <div className="messages" id="messages">
+          <div className="messages" id="messages" ref={messagesContainerRef}>
             {messages.length > 0 && <div className="date-divider"><span>Conversation</span></div>}
             {messages.map(message => <div className={`bubble ${message.senderId === user.id ? 'mine' : 'theirs'}`} key={message.id}>
               <div>{message.body}</div>
@@ -716,7 +768,21 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
                 {EMOJI_OPTIONS.map(emoji => <button type="button" className="emoji-option" key={emoji} aria-label={`Insert ${emoji}`} onClick={() => insertEmoji(emoji)}>{emoji}</button>)}
               </div>}
             </div>
-            <input ref={draftInputRef} value={draft} onChange={event => setDraft(event.target.value)} placeholder={isBlocked ? 'Messaging is disabled' : 'Type a message…'} maxLength={4000} aria-label="Type a message" disabled={isBlocked}/>
+            <textarea
+              ref={draftTextareaRef}
+              value={draft}
+              onChange={event => setDraft(event.target.value)}
+              onKeyDown={event => {
+                if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }}
+              placeholder={isBlocked ? 'Messaging is disabled' : 'Type a message…'}
+              maxLength={4000}
+              aria-label="Type a message"
+              rows={1}
+              disabled={isBlocked}
+            />
             <button aria-label="Send message" disabled={!draft.trim() || isBlocked}><Send size={18}/><span>Send</span></button>
           </form>
         </> : active && chatMode === 'incoming' && selectedRequest ? <div className="request-state">

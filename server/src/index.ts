@@ -268,12 +268,30 @@ app.post('/api/conversations', async (req, res) => {
 });
 app.get('/api/conversations', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const convos = await prisma.conversation.findMany({ where: { members: { some: { userId: user.id } }, messages: { some: {} }, OR: [{ request: { is: null } }, { request: { is: { status: 'ACCEPTED' } } }] }, include: { members: { include: { user: { select: { id: true, username: true } } } } }, orderBy: { createdAt: 'desc' } });
+  const convos = await prisma.conversation.findMany({
+    where: { members: { some: { userId: user.id } }, messages: { some: {} }, OR: [{ request: { is: null } }, { request: { is: { status: 'ACCEPTED' } } }] },
+    include: { members: { include: { user: { select: { id: true, username: true } } } } },
+    orderBy: { createdAt: 'desc' }
+  });
   const otherIds = convos.flatMap(convo => convo.members.filter(member => member.userId !== user.id).map(member => member.userId));
-  const blocks = await prisma.userBlock.findMany({ where: { OR: [{ blockerId: user.id, blockedId: { in: otherIds } }, { blockedId: user.id, blockerId: { in: otherIds } }] } });
+  const [blocks, unreadCounts] = await Promise.all([
+    prisma.userBlock.findMany({ where: { OR: [{ blockerId: user.id, blockedId: { in: otherIds } }, { blockedId: user.id, blockerId: { in: otherIds } }] } }),
+    Promise.all(convos.map(convo => {
+      const currentMember = convo.members.find(member => member.userId === user.id);
+      return prisma.message.count({
+        where: {
+          conversationId: convo.id,
+          senderId: { not: user.id },
+          receipts: { some: { userId: user.id, readAt: null } },
+          ...(currentMember?.clearedAt ? { createdAt: { gt: currentMember.clearedAt } } : {})
+        }
+      });
+    }))
+  ]);
   const blockedIds = new Set(blocks.map(block => block.blockerId === user.id ? block.blockedId : block.blockerId));
-  res.json(convos.map(convo => ({
+  res.json(convos.map((convo, index) => ({
     ...convo,
+    unreadCount: unreadCounts[index],
     members: convo.members.map(member => member.userId === user.id ? member : { ...member, clearedAt: null, deletedAt: null }),
     blocked: convo.members.some(member => blockedIds.has(member.userId) && member.userId !== user.id)
   })));
@@ -578,9 +596,9 @@ io.on('connection', socket => {
       const receipt = await prisma.messageReceipt.update({
         where: { messageId_userId: { messageId: data.data.messageId, userId: user.id }, deliveredAt: null },
         data: { deliveredAt: new Date() },
-        include: { message: { select: { senderId: true } } }
+        include: { message: { select: { senderId: true, conversationId: true } } }
       });
-      const update = { messageId: data.data.messageId, userId: user.id, deliveredAt: receipt.deliveredAt?.toISOString() || null, readAt: receipt.readAt?.toISOString() || null };
+      const update = { messageId: data.data.messageId, conversationId: receipt.message.conversationId, userId: user.id, deliveredAt: receipt.deliveredAt?.toISOString() || null, readAt: receipt.readAt?.toISOString() || null };
       io.to(`user:${receipt.message.senderId}`).emit('receipt:update', update);
       io.to(`user:${user.id}`).emit('receipt:update', update);
     } catch (err) {
@@ -599,7 +617,7 @@ io.on('connection', socket => {
           conversation: { members: { some: { userId: user.id } } },
           receipts: { some: { userId: user.id, readAt: null } }
         },
-        select: { id: true, senderId: true }
+        select: { id: true, senderId: true, conversationId: true }
       });
       if (!messages.length) return;
       const readAt = new Date();
@@ -609,7 +627,7 @@ io.on('connection', socket => {
       });
       const update = { userId: user.id, deliveredAt: readAt.toISOString(), readAt: readAt.toISOString() };
       for (const message of messages) {
-        const receiptUpdate = { ...update, messageId: message.id };
+        const receiptUpdate = { ...update, messageId: message.id, conversationId: message.conversationId };
         io.to(`user:${message.senderId}`).emit('receipt:update', receiptUpdate);
         io.to(`user:${user.id}`).emit('receipt:update', receiptUpdate);
       }
