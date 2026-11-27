@@ -43,6 +43,45 @@ button {
   letter-spacing: -.7px;
 }
 
+.notification-toggle {
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  display: grid;
+  place-items: center;
+  margin-left: auto;
+  padding: 0;
+  border: 0;
+  border-radius: 11px;
+  color: #788294;
+  background: transparent;
+}
+
+.notification-toggle.enabled {
+  color: var(--purple);
+  background: var(--lavender);
+}
+
+.notification-toggle:hover {
+  color: var(--purple-deep);
+  background: #e9e1ff;
+}
+
+.notification-toggle:focus-visible {
+  outline: 2px solid #8b70dc;
+  outline-offset: 2px;
+}
+
+.notification-toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  z-index: 20;
+  transform: translateX(-50%);
+  cursor: default;
+  background: #4320ad;
+}
+
 .brand-mark {
   width: 43px;
   height: 43px;

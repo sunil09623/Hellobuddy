@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { ArrowLeft, Ban, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
+import { ArrowLeft, Ban, Bell, BellOff, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
 import { API } from '../config';
 import type { User } from '../types';
 import { ProfileEditor } from './ProfileEditor';
@@ -38,6 +38,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [conversation, setConversation] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [requests, setRequests] = useState<ConversationRequest[]>([]);
+  const notificationStorageKey = `hellobuddy-notifications:${user.id}`;
+  const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem(notificationStorageKey) !== 'false');
+  const [notification, setNotification] = useState('');
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [sidebarView, setSidebarView] = useState<SidebarView>('chats');
   const [chatMode, setChatMode] = useState<ChatMode>('new');
@@ -58,6 +61,10 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [moreOpen, setMoreOpen] = useState(false);
   const activeConversationRef = useRef('');
   const recentIncomingMessageIdsRef = useRef(new Set<string>());
+  const recentIncomingRequestIdsRef = useRef(new Set<string>());
+  const notificationsEnabledRef = useRef(notificationsEnabled);
+  const notificationTimerRef = useRef<number | null>(null);
+  const notificationAudioRef = useRef<AudioContext | null>(null);
   const selectedRequestRef = useRef<ConversationRequest | null>(null);
   const searchRef = useRef(search);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -102,6 +109,74 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     setPeople(data);
   }, [token]);
 
+  function playNotificationSound() {
+    if (typeof window.AudioContext === 'undefined') {
+      setError('Notification sound is not supported by this browser.');
+      return;
+    }
+    const context = notificationAudioRef.current ?? new window.AudioContext();
+    notificationAudioRef.current = context;
+    const playTone = () => {
+      const start = context.currentTime;
+      const oscillator = context.createOscillator();
+      const volume = context.createGain();
+      oscillator.type = 'sine';
+      oscillator.frequency.setValueAtTime(880, start);
+      volume.gain.setValueAtTime(0.0001, start);
+      volume.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+      volume.gain.exponentialRampToValueAtTime(0.0001, start + 0.24);
+      oscillator.connect(volume);
+      volume.connect(context.destination);
+      oscillator.start(start);
+      oscillator.stop(start + 0.25);
+    };
+    if (context.state === 'running') {
+      playTone();
+    } else {
+      void context.resume().then(() => {
+        if (context.state === 'running') playTone();
+        else setError('Notification sound could not be enabled. Check your browser audio settings.');
+      }).catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
+    }
+  }
+
+  function showNotification(message: string) {
+    if (!notificationsEnabledRef.current) return;
+    setNotification(message);
+    if (notificationTimerRef.current !== null) window.clearTimeout(notificationTimerRef.current);
+    notificationTimerRef.current = window.setTimeout(() => {
+      notificationTimerRef.current = null;
+      setNotification('');
+    }, 5000);
+    playNotificationSound();
+  }
+
+  function toggleNotifications() {
+    const next = !notificationsEnabled;
+    notificationsEnabledRef.current = next;
+    setNotificationsEnabled(next);
+    try {
+      window.localStorage.setItem(notificationStorageKey, String(next));
+    } catch {
+      setError('Unable to save your notification preference in this browser.');
+    }
+    if (next) {
+      if (typeof window.AudioContext !== 'undefined') {
+        const context = notificationAudioRef.current ?? new window.AudioContext();
+        notificationAudioRef.current = context;
+        if (context.state === 'suspended') {
+          void context.resume().catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
+        }
+      }
+    } else {
+      setNotification('');
+      if (notificationTimerRef.current !== null) {
+        window.clearTimeout(notificationTimerRef.current);
+        notificationTimerRef.current = null;
+      }
+    }
+  }
+
   useEffect(() => {
     activeConversationRef.current = conversation;
   }, [conversation]);
@@ -113,6 +188,32 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   useEffect(() => {
     searchRef.current = search;
   }, [search]);
+
+  useEffect(() => {
+    notificationsEnabledRef.current = notificationsEnabled;
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
+    if (!notificationsEnabled) return;
+    const prepareAudioOnInteraction = () => {
+      if (notificationAudioRef.current || typeof window.AudioContext === 'undefined') return;
+      const context = new window.AudioContext();
+      notificationAudioRef.current = context;
+      document.removeEventListener('pointerdown', prepareAudioOnInteraction);
+      document.removeEventListener('keydown', prepareAudioOnInteraction);
+      void context.resume().catch(() => setError('Notification sound could not be enabled. Check your browser audio settings.'));
+    };
+    document.addEventListener('pointerdown', prepareAudioOnInteraction);
+    document.addEventListener('keydown', prepareAudioOnInteraction);
+    return () => {
+      document.removeEventListener('pointerdown', prepareAudioOnInteraction);
+      document.removeEventListener('keydown', prepareAudioOnInteraction);
+    };
+  }, [notificationsEnabled]);
+
+  useEffect(() => () => {
+    if (notificationTimerRef.current !== null) window.clearTimeout(notificationTimerRef.current);
+  }, []);
 
   useLayoutEffect(() => {
     if (!scrollToBottomRef.current) return;
@@ -202,6 +303,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
             const oldestMessageId = recentMessageIds.values().next().value;
             if (oldestMessageId !== undefined) recentMessageIds.delete(oldestMessageId);
           }
+          showNotification('You have a new message.');
         }
         const conversationIsVisible = message.conversationId === activeConversationRef.current && document.visibilityState === 'visible';
         if (isNewMessage && !conversationIsVisible) {
@@ -260,6 +362,15 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     });
     s.on('request:new', (event: { request: ConversationRequest }) => {
       setRequests(prev => [event.request, ...prev.filter(request => request.id !== event.request.id)]);
+      const recentRequestIds = recentIncomingRequestIdsRef.current;
+      if (event.request.recipientId === user.id && event.request.status === 'PENDING' && !recentRequestIds.has(event.request.id)) {
+        recentRequestIds.add(event.request.id);
+        if (recentRequestIds.size > 500) {
+          const oldestRequestId = recentRequestIds.values().next().value;
+          if (oldestRequestId !== undefined) recentRequestIds.delete(oldestRequestId);
+        }
+        showNotification(`New conversation request from ${event.request.requester.username}.`);
+      }
     });
     s.on('request:update', (update: { requestId: string; status: string; conversationId?: string; message?: Message }) => {
       const requestStatus = update.status === 'DECLINED' ? 'DECLINED' : update.status as ConversationRequest['status'];
@@ -647,7 +758,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   return (
     <main className={`layout ${active ? 'mobile-chat-open' : ''}`}>
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HelloBuddy</b></div>
+        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HelloBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
         <div className="profile-row">
           <button type="button" className="avatar profile-avatar profile-avatar-trigger" style={{ backgroundColor: user.avatarColor || '#5524c8' }} aria-label="Edit profile" title="Edit profile" onClick={() => setProfileEditorOpen(true)}>
             {user.avatarData ? <img src={user.avatarData} alt=""/> : `${user.firstName?.trim().charAt(0) || ''}${user.lastName?.trim().charAt(0) || ''}`.toUpperCase() || user.username[0]?.toUpperCase()}
@@ -724,6 +835,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         </div>}
         <button className="logout" onClick={onLogout}>Log out</button>
       </aside>
+      {notification && <div className="toast notification-toast" role="status">{notification}</div>}
       <section className="chat">
         <header className="chathead">
           {active ? <>

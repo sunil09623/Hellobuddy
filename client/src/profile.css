@@ -195,7 +195,7 @@
 
 .profile-fields {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 18px 20px;
 }
 
@@ -319,10 +319,6 @@
 .profile-choice-menu button:focus-visible {
   outline: 2px solid #8b70dc;
   outline-offset: -2px;
-}
-
-.profile-email-field {
-  grid-column: 1 / -1;
 }
 
 .profile-email-row,
@@ -457,12 +453,7 @@
   }
 
   .profile-fields {
-    grid-template-columns: minmax(0, 1fr);
     gap: 15px;
-  }
-
-  .profile-email-field {
-    grid-column: auto;
   }
 
   .profile-email-row {
