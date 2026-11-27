@@ -63,7 +63,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const moreMenuRef = useRef<HTMLDivElement>(null);
   const moreButtonRef = useRef<HTMLButtonElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const scrollToBottomAfterSendRef = useRef(false);
+  const scrollToBottomRef = useRef(false);
   const draftInputRef = useRef<HTMLInputElement>(null);
   const draftTextareaRef = useRef<HTMLTextAreaElement>(null);
   const profileShareInputRef = useRef<HTMLInputElement>(null);
@@ -115,8 +115,8 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }, [search]);
 
   useLayoutEffect(() => {
-    if (!scrollToBottomAfterSendRef.current) return;
-    scrollToBottomAfterSendRef.current = false;
+    if (!scrollToBottomRef.current) return;
+    scrollToBottomRef.current = false;
     const container = messagesContainerRef.current;
     if (container) container.scrollTop = container.scrollHeight;
   }, [messages]);
@@ -317,6 +317,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     }, ...prev.filter(item => item.id !== conversationId)]);
     socket?.emit('conversation:join', { conversationId });
     if (prefetchedMessages) {
+      if (prefetchedMessages.length) scrollToBottomRef.current = true;
       setMessages(prefetchedMessages);
       return;
     }
@@ -325,6 +326,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       const historyResponse = await fetch(`${API}/api/conversations/${conversationId}/messages`, { headers: authHeaders() });
       const historyData = await historyResponse.json() as Message[] | { error?: string };
       if (!historyResponse.ok || !Array.isArray(historyData)) throw new Error(!Array.isArray(historyData) ? historyData.error || 'Unable to load chat history' : 'Unable to load chat history');
+      if (historyData.length) scrollToBottomRef.current = true;
       setMessages(historyData);
       const unread = historyData.filter(message => message.senderId !== user.id && !(message.receipts || []).find(receipt => receipt.userId === user.id)?.readAt).map(message => message.id);
       if (unread.length) socket?.emit('receipt:read', { messageIds: unread });
@@ -471,7 +473,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     if (!draft.trim() || !active || !conversation || !socket || isBlocked) return;
     const body = draft.trim(), clientMessageId = crypto.randomUUID();
     const optimistic: Message = { id: `temp-${clientMessageId}`, clientMessageId, conversationId: conversation, senderId: user.id, body, createdAt: new Date().toISOString() };
-    scrollToBottomAfterSendRef.current = true;
+    scrollToBottomRef.current = true;
     setMessages(prev => [...prev, optimistic]); setDraft('');
     socket.emit('message:send', { clientMessageId, conversationId: conversation, body }, (ack: { ok: boolean; message?: Message; error?: string }) => {
       if (ack.ok && ack.message) setMessages(prev => prev.map(message => message.clientMessageId === clientMessageId ? ack.message! : message));
