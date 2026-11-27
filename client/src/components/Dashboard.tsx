@@ -773,7 +773,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
               value={draft}
               onChange={event => setDraft(event.target.value)}
               onKeyDown={event => {
-                if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
+                if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing || window.matchMedia('(max-width: 720px)').matches) return;
                 event.preventDefault();
                 event.currentTarget.form?.requestSubmit();
               }}
