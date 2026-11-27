@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { ArrowLeft, Ban, Bell, BellOff, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
+import { ArrowLeft, Ban, Bell, BellOff, Check, Eraser, LogOut, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
 import { API } from '../config';
-import { createWrappedIdentity, decryptText, encryptText, ENCRYPTED_MESSAGE_PREFIX, loadLocalIdentity, parseEncryptionPublicKey, pinPeerPublicKey, removeLocalIdentity, saveLocalIdentity, unlockWrappedIdentity, type EncryptionIdentity, type EncryptionPublicKey, type EncryptionContext, type WrappedPrivateKey } from '../e2ee';
+import { createWrappedIdentity, decryptText, encryptText, ENCRYPTED_MESSAGE_PREFIX, loadLocalIdentity, migrateLegacyWrappedIdentity, parseEncryptionPublicKey, pinPeerPublicKey, saveLocalIdentity, unlockWrappedIdentity, type EncryptionIdentity, type EncryptionPublicKey, type EncryptionContext, type WrappedPrivateKey } from '../e2ee';
 import type { User } from '../types';
 import { ProfileEditor } from './ProfileEditor';
 
@@ -27,14 +27,17 @@ type SidebarView = 'chats' | 'requests' | 'blocked';
 type DashboardProps = {
   user: User;
   token: string;
+  loginPassword: string | null;
+  onLoginPasswordConsumed: () => void;
   onUserChange: (user: User) => void;
   onTokenChange: (token: string) => void;
   onLogout: () => void;
 };
 const EMOJI_OPTIONS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🎉', '🔥'];
-type EncryptionSetupMode = 'setup' | 'unlock';
 
-export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }: DashboardProps) {
+class EncryptionKeyConflictError extends Error {}
+
+export function Dashboard({ user, token, loginPassword, onLoginPasswordConsumed, onUserChange, onTokenChange, onLogout }: DashboardProps) {
   const [people, setPeople] = useState<User[]>([]);
   const [active, setActive] = useState<User | null>(null);
   const [conversation, setConversation] = useState('');
@@ -42,14 +45,6 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [requests, setRequests] = useState<ConversationRequest[]>([]);
   const [encryptionReady, setEncryptionReady] = useState(false);
   const [encryptionError, setEncryptionError] = useState('');
-  const [encryptionSetupMode, setEncryptionSetupMode] = useState<EncryptionSetupMode | null>(null);
-  const [encryptionWrappedKey, setEncryptionWrappedKey] = useState<WrappedPrivateKey | null>(null);
-  const [encryptionServerPublicKey, setEncryptionServerPublicKey] = useState<EncryptionPublicKey | null>(null);
-  const [legacyHistoryResetRequired, setLegacyHistoryResetRequired] = useState(false);
-  const [legacyHistoryResetConfirmed, setLegacyHistoryResetConfirmed] = useState(false);
-  const [encryptionPassphrase, setEncryptionPassphrase] = useState('');
-  const [encryptionPassphraseConfirmation, setEncryptionPassphraseConfirmation] = useState('');
-  const [encryptionWorking, setEncryptionWorking] = useState(false);
   const notificationStorageKey = `hellobuddy-notifications:${user.id}`;
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem(notificationStorageKey) !== 'false');
   const [notification, setNotification] = useState('');
@@ -96,37 +91,89 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const reactionPickerRef = useRef<HTMLDivElement>(null);
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
 
-  async function initializeEncryptionIdentity(): Promise<EncryptionIdentity | null> {
+  async function initializeEncryptionIdentity(accountPassword: string | null): Promise<EncryptionIdentity | null> {
     const storedIdentity = await loadLocalIdentity(user.id);
     const response = await fetch(`${API}/api/users/me/encryption-key`, { headers: authHeaders() });
     const data = await response.json() as { publicKey?: unknown; wrappedPrivateKey?: WrappedPrivateKey | null; error?: string };
     if (!response.ok) throw new Error(data.error || 'Unable to load your encryption key');
     const serverKey = data.publicKey === null || data.publicKey === undefined ? null : parseEncryptionPublicKey(data.publicKey);
-    if (serverKey && data.wrappedPrivateKey) {
-      if (storedIdentity && serverKey.x === storedIdentity.publicKey.x && serverKey.y === storedIdentity.publicKey.y) return storedIdentity;
-      if (storedIdentity) await removeLocalIdentity(user.id);
-      setEncryptionWrappedKey(data.wrappedPrivateKey);
-      setEncryptionServerPublicKey(serverKey);
-      setLegacyHistoryResetRequired(false);
-      setLegacyHistoryResetConfirmed(false);
-      setEncryptionSetupMode('unlock');
-      return null;
+    if (serverKey && storedIdentity &&
+        serverKey.x === storedIdentity.publicKey.x &&
+        serverKey.y === storedIdentity.publicKey.y &&
+        (!accountPassword || data.wrappedPrivateKey?.version === 2)) {
+      return storedIdentity;
     }
-    setEncryptionWrappedKey(null);
-    setEncryptionServerPublicKey(serverKey);
-    setLegacyHistoryResetRequired(Boolean(serverKey || storedIdentity));
-    setLegacyHistoryResetConfirmed(false);
-    setEncryptionSetupMode('setup');
-    return null;
+    if (serverKey && data.wrappedPrivateKey?.version === 2) {
+      if (!accountPassword) throw new Error('Sign in again to restore secure messaging on this device.');
+      const identity = await unlockWrappedIdentity(user.id, data.wrappedPrivateKey, serverKey, accountPassword);
+      await saveLocalIdentity(identity);
+      return identity;
+    }
+    if (serverKey && data.wrappedPrivateKey?.version === 1 && accountPassword) {
+      let migrated: Awaited<ReturnType<typeof migrateLegacyWrappedIdentity>>;
+      try {
+        migrated = await migrateLegacyWrappedIdentity(
+          user.id,
+          data.wrappedPrivateKey,
+          serverKey,
+          accountPassword,
+          accountPassword
+        );
+      } catch {
+        return createAndRegisterAccountIdentity(accountPassword, true);
+      }
+      return registerAndStoreEncryptionIdentity(migrated.identity, migrated.wrappedPrivateKey, accountPassword);
+    }
+    if (!accountPassword) throw new Error('Sign in again to enable secure messaging on this device.');
+    return createAndRegisterAccountIdentity(accountPassword, Boolean(data.wrappedPrivateKey));
   }
 
-  async function registerEncryptionPublicKey(publicKey: EncryptionPublicKey, wrappedPrivateKey: WrappedPrivateKey) {
+  async function createAndRegisterAccountIdentity(accountPassword: string, replaceLegacyKey: boolean) {
+    const wrapped = await createWrappedIdentity(user.id, accountPassword);
+    return registerAndStoreEncryptionIdentity(wrapped.identity, wrapped.wrappedPrivateKey, accountPassword, replaceLegacyKey);
+  }
+
+  async function registerAndStoreEncryptionIdentity(
+    identity: EncryptionIdentity,
+    wrappedPrivateKey: WrappedPrivateKey,
+    accountPassword: string,
+    replaceLegacyKey = false
+  ) {
+    registeringEncryptionKeyRef.current = true;
+    try {
+      try {
+        await registerEncryptionPublicKey(identity.publicKey, wrappedPrivateKey, replaceLegacyKey);
+      } catch (error) {
+        if (!(error instanceof EncryptionKeyConflictError)) throw error;
+        const response = await fetch(`${API}/api/users/me/encryption-key`, { headers: authHeaders() });
+        const data = await response.json() as { publicKey?: unknown; wrappedPrivateKey?: WrappedPrivateKey | null; error?: string };
+        if (!response.ok || !data.publicKey || data.wrappedPrivateKey?.version !== 2) {
+          throw new Error(data.error || 'Another device changed your encryption key. Sign in again to retry.');
+        }
+        const serverKey = parseEncryptionPublicKey(data.publicKey);
+        const recoveredIdentity = await unlockWrappedIdentity(user.id, data.wrappedPrivateKey, serverKey, accountPassword);
+        await saveLocalIdentity(recoveredIdentity);
+        return recoveredIdentity;
+      }
+      await saveLocalIdentity(identity);
+    } finally {
+      registeringEncryptionKeyRef.current = false;
+    }
+    return identity;
+  }
+
+  async function registerEncryptionPublicKey(
+    publicKey: EncryptionPublicKey,
+    wrappedPrivateKey: WrappedPrivateKey,
+    replaceLegacyKey = false
+  ) {
     const response = await fetch(`${API}/api/users/me/encryption-key`, {
       method: 'PUT',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ publicKey, wrappedPrivateKey })
+      body: JSON.stringify({ publicKey, wrappedPrivateKey, ...(replaceLegacyKey ? { replaceLegacyKey: true } : {}) })
     });
     const data = await response.json() as { error?: string };
+    if (response.status === 409) throw new EncryptionKeyConflictError(data.error || 'An account encryption key is already configured.');
     if (!response.ok) throw new Error(data.error || 'Unable to register your encryption key');
   }
 
@@ -307,8 +354,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     encryptionIdentityRef.current = null;
     setEncryptionReady(false);
     setEncryptionError('');
-    setEncryptionSetupMode(null);
-    void initializeEncryptionIdentity().then(identity => {
+    const accountPassword = loginPassword;
+    if (accountPassword) onLoginPasswordConsumed();
+    void initializeEncryptionIdentity(accountPassword).then(identity => {
       if (cancelled) return;
       encryptionIdentityRef.current = identity;
       setEncryptionReady(Boolean(identity));
@@ -320,60 +368,6 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     });
     return () => { cancelled = true; };
   }, [token, user.id]);
-
-  async function completeEncryptionSetup(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!encryptionSetupMode || encryptionWorking) return;
-    if (encryptionSetupMode === 'setup') {
-      if (encryptionPassphrase.length < 12) {
-        setEncryptionError('Choose an account encryption passphrase with at least 12 characters.');
-        return;
-      }
-      if (encryptionPassphrase !== encryptionPassphraseConfirmation) {
-        setEncryptionError('The passphrases do not match.');
-        return;
-      }
-      if (legacyHistoryResetRequired && !legacyHistoryResetConfirmed) {
-        setEncryptionError('Confirm that you understand the old encrypted history will be permanently deleted.');
-        return;
-      }
-    } else if (!encryptionPassphrase) {
-      setEncryptionError('Enter your account encryption passphrase.');
-      return;
-    }
-
-    setEncryptionWorking(true);
-    setEncryptionError('');
-    try {
-      let identity: EncryptionIdentity;
-      if (encryptionSetupMode === 'unlock') {
-        if (!encryptionServerPublicKey || !encryptionWrappedKey) throw new Error('The saved account encryption key is unavailable.');
-        identity = await unlockWrappedIdentity(user.id, encryptionWrappedKey, encryptionServerPublicKey, encryptionPassphrase);
-      } else {
-        const wrapped = await createWrappedIdentity(user.id, encryptionPassphrase);
-        registeringEncryptionKeyRef.current = true;
-        await registerEncryptionPublicKey(wrapped.identity.publicKey, wrapped.wrappedPrivateKey);
-        identity = wrapped.identity;
-      }
-      await saveLocalIdentity(identity);
-      encryptionIdentityRef.current = identity;
-      setEncryptionSetupMode(null);
-      setEncryptionWrappedKey(null);
-      setEncryptionServerPublicKey(null);
-      setEncryptionPassphrase('');
-      setEncryptionPassphraseConfirmation('');
-      setLegacyHistoryResetRequired(false);
-      setLegacyHistoryResetConfirmed(false);
-      setEncryptionReady(true);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unable to set up account encryption';
-      setEncryptionError(message);
-      setError(message);
-    } finally {
-      registeringEncryptionKeyRef.current = false;
-      setEncryptionWorking(false);
-    }
-  }
 
   useEffect(() => {
     if (!notificationsEnabled) return;
@@ -537,7 +531,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         setMessages([]);
         setEncryptionReady(false);
         setEncryptionError('');
-        void initializeEncryptionIdentity().then(identity => {
+        void initializeEncryptionIdentity(null).then(identity => {
           encryptionIdentityRef.current = identity;
           setEncryptionReady(Boolean(identity));
           if (identity) {
@@ -1037,38 +1031,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   return (
     <main className={`layout ${active ? 'mobile-chat-open' : ''}`}>
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HeyBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
-        {!encryptionReady && !encryptionError && !encryptionSetupMode && <div className="encryption-status" role="status">Setting up secure messaging…</div>}
+        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HeyBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button><button type="button" className="logout-toggle" aria-label="Log out" title="Log out" onClick={onLogout}><LogOut size={18}/></button></div>
+        {!encryptionReady && !encryptionError && <div className="encryption-status" role="status">Setting up secure messaging…</div>}
         {encryptionError && <div className="encryption-warning" role="alert">{encryptionError}</div>}
-        {encryptionSetupMode && <form className="encryption-setup" onSubmit={event => void completeEncryptionSetup(event)}>
-          <strong>{encryptionSetupMode === 'unlock' ? 'Unlock account encryption' : 'Set up account encryption'}</strong>
-          <p>{encryptionSetupMode === 'unlock'
-            ? 'Enter your account passphrase to access encrypted messages on this device.'
-            : 'This passphrase protects your account key and lets you use secure messaging on other devices. Keep it safe; it cannot be reset.'}</p>
-          {legacyHistoryResetRequired && <label className="encryption-reset-confirm">
-            <input type="checkbox" checked={legacyHistoryResetConfirmed} onChange={event => setLegacyHistoryResetConfirmed(event.target.checked)}/>
-            <span>I understand my existing encrypted history will be permanently deleted.</span>
-          </label>}
-          <input
-            type="password"
-            autoComplete={encryptionSetupMode === 'unlock' ? 'current-password' : 'new-password'}
-            aria-label="Account encryption passphrase"
-            placeholder="Account passphrase"
-            value={encryptionPassphrase}
-            onChange={event => setEncryptionPassphrase(event.target.value)}
-          />
-          {encryptionSetupMode === 'setup' && <input
-            type="password"
-            autoComplete="new-password"
-            aria-label="Confirm account encryption passphrase"
-            placeholder="Confirm passphrase"
-            value={encryptionPassphraseConfirmation}
-            onChange={event => setEncryptionPassphraseConfirmation(event.target.value)}
-          />}
-          <button type="submit" disabled={encryptionWorking}>
-            {encryptionWorking ? 'Securing…' : encryptionSetupMode === 'unlock' ? 'Unlock' : 'Set up secure messaging'}
-          </button>
-        </form>}
         <div className="profile-row">
           <button type="button" className="avatar profile-avatar profile-avatar-trigger" style={{ backgroundColor: user.avatarColor || '#5524c8' }} aria-label="Edit profile" title="Edit profile" onClick={() => setProfileEditorOpen(true)}>
             {user.avatarData ? <img src={user.avatarData} alt=""/> : `${user.firstName?.trim().charAt(0) || ''}${user.lastName?.trim().charAt(0) || ''}`.toUpperCase() || user.username[0]?.toUpperCase()}
@@ -1143,7 +1108,6 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
           </div>)}
           {!filteredBlocks.length && <div className="no-people">{blockedQuery ? 'No blocked users match your search.' : 'You have not blocked anyone.'}</div>}
         </div>}
-        <button className="logout" onClick={onLogout}>Log out</button>
       </aside>
       {notification && <div className="toast notification-toast" role="status">{notification}</div>}
       <section className="chat">

@@ -28,7 +28,7 @@ const ENCRYPTION_PUBLIC_KEY_SCHEMA = z.object({
   y: z.string().regex(/^[A-Za-z0-9_-]{43}$/)
 }).strict();
 const WRAPPED_PRIVATE_KEY_SCHEMA = z.object({
-  version: z.literal(1),
+  version: z.union([z.literal(1), z.literal(2)]),
   iterations: z.number().int().min(100_000).max(1_000_000),
   salt: z.string().regex(/^[A-Za-z0-9_-]{22}$/),
   iv: z.string().regex(/^[A-Za-z0-9_-]{16}$/),
@@ -242,7 +242,8 @@ app.put('/api/users/me/encryption-key', async (req, res) => {
   if (!user) return res.status(401).json({ error: 'Unauthorized' });
   const parsed = z.object({
     publicKey: ENCRYPTION_PUBLIC_KEY_SCHEMA,
-    wrappedPrivateKey: WRAPPED_PRIVATE_KEY_SCHEMA
+    wrappedPrivateKey: WRAPPED_PRIVATE_KEY_SCHEMA,
+    replaceLegacyKey: z.boolean().optional()
   }).strict().safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Invalid account encryption key' });
   try {
@@ -258,47 +259,57 @@ app.put('/api/users/me/encryption-key', async (req, res) => {
         FROM "User" WHERE "id" = ${user.id} FOR UPDATE
       `;
       if (!existing) return { status: 'missing' as const };
+      const getPeerIds = async () => {
+        const peerIds = new Set<string>();
+        if (existing.encryptionPublicKey) {
+          const memberships = await transaction.conversationMember.findMany({
+            where: { userId: user.id },
+            select: { conversationId: true }
+          });
+          const peerMembers = await transaction.conversationMember.findMany({
+            where: { conversationId: { in: memberships.map(member => member.conversationId) }, userId: { not: user.id } },
+            select: { userId: true }
+          });
+          peerMembers.forEach(member => peerIds.add(member.userId));
+          const relatedRequests = await transaction.conversationRequest.findMany({
+            where: { OR: [{ requesterId: user.id }, { recipientId: user.id }] },
+            select: { requesterId: true, recipientId: true }
+          });
+          relatedRequests.forEach(request => peerIds.add(request.requesterId === user.id ? request.recipientId : request.requesterId));
+        }
+        return [...peerIds];
+      };
       if (existing.encryptionPrivateKeyBackup) {
         const savedKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPublicKey || 'null'));
         const savedBackup = WRAPPED_PRIVATE_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPrivateKeyBackup));
         const keyMatches = savedKey.x === parsed.data.publicKey.x && savedKey.y === parsed.data.publicKey.y;
         const backupMatches = JSON.stringify(savedBackup) === encodedBackup;
+        if (parsed.data.replaceLegacyKey && savedBackup.version === 1 && parsed.data.wrappedPrivateKey.version === 2) {
+          const peerIds = await getPeerIds();
+          const keyVersion = existing.encryptionKeyVersion + 1;
+          await transaction.$executeRaw`
+            UPDATE "User"
+            SET "encryptionPublicKey" = ${encodedKey},
+                "encryptionPrivateKeyBackup" = ${encodedBackup},
+                "encryptionKeyVersion" = ${keyVersion}
+            WHERE "id" = ${user.id}
+          `;
+          return { status: 'saved' as const, keyVersion, peerIds };
+        }
+        if (keyMatches && savedBackup.version === 1 && parsed.data.wrappedPrivateKey.version === 2) {
+          await transaction.$executeRaw`
+            UPDATE "User"
+            SET "encryptionPrivateKeyBackup" = ${encodedBackup}
+            WHERE "id" = ${user.id}
+          `;
+          return { status: 'saved' as const, keyVersion: existing.encryptionKeyVersion, peerIds: [] as string[] };
+        }
         return keyMatches && backupMatches
           ? { status: 'saved' as const, keyVersion: existing.encryptionKeyVersion, peerIds: [] as string[] }
           : { status: 'conflict' as const };
       }
 
-      const peerIds = new Set<string>();
-      if (existing.encryptionPublicKey) {
-        const memberships = await transaction.conversationMember.findMany({
-          where: { userId: user.id },
-          select: { conversationId: true }
-        });
-        const peerMembers = await transaction.conversationMember.findMany({
-          where: { conversationId: { in: memberships.map(member => member.conversationId) }, userId: { not: user.id } },
-          select: { userId: true }
-        });
-        peerMembers.forEach(member => peerIds.add(member.userId));
-        const relatedRequests = await transaction.conversationRequest.findMany({
-          where: { OR: [{ requesterId: user.id }, { recipientId: user.id }] },
-          select: { requesterId: true, recipientId: true }
-        });
-        relatedRequests.forEach(request => peerIds.add(request.requesterId === user.id ? request.recipientId : request.requesterId));
-      }
-
-      await transaction.message.deleteMany({
-        where: {
-          body: { startsWith: ENCRYPTED_MESSAGE_PREFIX },
-          conversation: { members: { some: { userId: user.id } } }
-        }
-      });
-      await transaction.conversationRequest.deleteMany({
-        where: {
-          initialMessage: { startsWith: ENCRYPTED_MESSAGE_PREFIX },
-          OR: [{ requesterId: user.id }, { recipientId: user.id }]
-        }
-      });
-
+      const peerIds = await getPeerIds();
       const keyVersion = existing.encryptionPublicKey ? existing.encryptionKeyVersion + 1 : existing.encryptionKeyVersion;
       await transaction.$executeRaw`
         UPDATE "User"
@@ -307,7 +318,7 @@ app.put('/api/users/me/encryption-key', async (req, res) => {
             "encryptionKeyVersion" = ${keyVersion}
         WHERE "id" = ${user.id}
       `;
-      return { status: 'saved' as const, keyVersion, peerIds: [...peerIds] };
+      return { status: 'saved' as const, keyVersion, peerIds };
     });
     if (outcome.status === 'missing') return res.status(404).json({ error: 'User not found' });
     if (outcome.status === 'conflict') return res.status(409).json({ error: 'An account encryption key is already configured and cannot be replaced.' });

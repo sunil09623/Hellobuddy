@@ -60,6 +60,7 @@ function App() {
   const [email, setEmail] = useState('');
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
+  const [encryptionLoginPassword, setEncryptionLoginPassword] = useState<string | null>(null);
   const [authScreen, setAuthScreen] = useState<AuthScreen>('login');
   const [authError, setAuthError] = useState('');
   const [authBusy, setAuthBusy] = useState(false);
@@ -85,6 +86,7 @@ function App() {
       const data = await response.json().catch(() => ({})) as { user?: User; token?: string; error?: string };
       if (!response.ok) throw new Error(data.error || `Authentication failed (${response.status})`);
       if (!data.user || !data.token) throw new Error('Invalid authentication response');
+      setEncryptionLoginPassword(password);
       sessionStorage.setItem(USER_STORAGE_KEY, JSON.stringify(data.user));
       sessionStorage.setItem(TOKEN_STORAGE_KEY, data.token);
       setSession({ user: data.user, token: data.token });
@@ -101,6 +103,7 @@ function App() {
     sessionStorage.removeItem(USER_STORAGE_KEY);
     sessionStorage.removeItem(TOKEN_STORAGE_KEY);
     setSession({ user: null, token: '' });
+    setEncryptionLoginPassword(null);
     setPassword('');
     setAuthScreen('login');
   }
@@ -118,7 +121,15 @@ function App() {
   if (sharedProfileUsername) return <SharedProfile username={sharedProfileUsername}/>;
 
   if (user && token) {
-    return <Dashboard user={user} token={token} onUserChange={updateUser} onTokenChange={updateToken} onLogout={logout}/>;
+    return <Dashboard
+      user={user}
+      token={token}
+      loginPassword={encryptionLoginPassword}
+      onLoginPasswordConsumed={() => setEncryptionLoginPassword(null)}
+      onUserChange={updateUser}
+      onTokenChange={updateToken}
+      onLogout={logout}
+    />;
   }
 
   if (authScreen === 'register') {
