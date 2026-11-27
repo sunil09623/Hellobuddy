@@ -1,4 +1,4 @@
-# HelloBuddy
+# HeyBuddy
 
 A minimal, one-to-one real-time chat MVP. It excludes group chats, attachments, voice/video calls, and push notifications.
 
@@ -6,7 +6,7 @@ A minimal, one-to-one real-time chat MVP. It excludes group chats, attachments, 
 Install Node.js LTS (npm is bundled) and Docker Desktop. Start Docker Desktop before using the database.
 
 ## First-time setup
-From the extracted `hellobuddy` project root, open PowerShell and run:
+From the project root, open PowerShell and run:
 
 ```powershell
 npm install

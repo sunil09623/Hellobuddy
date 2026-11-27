@@ -105,9 +105,9 @@ app.post('/api/users/me/email-verification/request', async (req, res) => {
     await transportConfig.transport.sendMail({
       from: transportConfig.from,
       to: email,
-      subject: 'Your HelloBuddy verification code',
-      text: `Your HelloBuddy email verification code is ${code}. It expires in 10 minutes.`,
-      html: `<p>Your HelloBuddy email verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`
+      subject: 'Your HeyBuddy verification code',
+      text: `Your HeyBuddy email verification code is ${code}. It expires in 10 minutes.`,
+      html: `<p>Your HeyBuddy email verification code is <strong>${code}</strong>.</p><p>It expires in 10 minutes.</p>`
     });
     await prisma.emailVerification.upsert({
       where: { userId: user.id },
@@ -636,4 +636,4 @@ io.on('connection', socket => {
     }
   });
 });
-server.listen(Number(process.env.PORT || 4000), () => console.log(`HelloBuddy API listening on ${process.env.PORT || 4000}`));
+server.listen(Number(process.env.PORT || 4000), () => console.log(`HeyBuddy API listening on ${process.env.PORT || 4000}`));

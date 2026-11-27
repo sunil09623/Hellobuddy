@@ -9,7 +9,7 @@ export function AuthShell({ title, subtitle, children }: AuthShellProps) {
       <div className="auth-card">
         <section className="auth-brand-panel">
           <div className="auth-brand-mark"><MessageCircle size={42} strokeWidth={2.5}/></div>
-          <h2>HelloBuddy</h2>
+          <h2>HeyBuddy</h2>
           <p>Chat. Connect. Be happy.</p>
           <div className="auth-feature-card">
             <strong>Good conversations start here</strong>

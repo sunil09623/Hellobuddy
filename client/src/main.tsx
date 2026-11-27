@@ -91,7 +91,7 @@ function App() {
       setPassword('');
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Authentication failed';
-      setAuthError(message.includes('fetch') ? `Cannot reach HelloBuddy server at ${API}. Start the backend and database first.` : message);
+      setAuthError(message.includes('fetch') ? `Cannot reach HeyBuddy server at ${API}. Start the backend and database first.` : message);
     } finally {
       setAuthBusy(false);
     }

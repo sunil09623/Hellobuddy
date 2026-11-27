@@ -18,7 +18,7 @@ export function Register({
   email, username, password, busy, error, onEmailChange, onUsernameChange, onPasswordChange, onSubmit, onLogin
 }: RegisterProps) {
   return (
-    <AuthShell title="Create your account" subtitle="Join HelloBuddy and start chatting.">
+    <AuthShell title="Create your account" subtitle="Join HeyBuddy and start chatting.">
       <form className="auth-form" onSubmit={onSubmit}>
         <div className="auth-tabs">
           <button type="button" onClick={onLogin}>Login</button>

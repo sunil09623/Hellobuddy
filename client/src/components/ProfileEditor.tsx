@@ -337,7 +337,7 @@ export function ProfileEditor({ user, token, onCancel, onUserChange, onTokenChan
           </button>
           <div>
             <h1>Edit profile</h1>
-            <p>Update your HelloBuddy profile details.</p>
+            <p>Update your HeyBuddy profile details.</p>
           </div>
         </header>
         <form className="profile-editor-form" onSubmit={saveProfile}>

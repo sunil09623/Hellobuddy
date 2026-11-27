@@ -26,7 +26,7 @@ export function Login({
         <button type="submit" disabled={busy}>{busy ? 'Please wait…' : 'Log in'}</button>
         {error && <div className="error">{error}</div>}
         <button type="button" className="link-button" onClick={onForgotPassword}>Forgot password?</button>
-        <button type="button" className="link-button" onClick={onRegister}>New to HelloBuddy? Create account</button>
+        <button type="button" className="link-button" onClick={onRegister}>New to HeyBuddy? Create account</button>
       </form>
     </AuthShell>
   );

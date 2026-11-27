@@ -42,16 +42,16 @@ export function SharedProfile({ username }: { username: string }) {
   return (
     <main className="shared-profile-page">
       <section className="shared-profile-card">
-        <div className="shared-profile-brand"><MessageCircle size={23}/> HelloBuddy</div>
+        <div className="shared-profile-brand"><MessageCircle size={23}/> HeyBuddy</div>
         {loading ? <p className="shared-profile-state">Loading profile…</p> : error ? <div className="error shared-profile-error" role="alert">{error}</div> : profile && <>
           <div className="shared-profile-avatar" style={{ backgroundColor: profile.avatarColor }}>
             {profile.avatarData ? <img src={profile.avatarData} alt=""/> : <span>{initials}</span>}
           </div>
           <h1>{fullName || profile.username}</h1>
           {fullName && <p className="shared-profile-username">@{profile.username}</p>}
-          <p className="shared-profile-caption">HelloBuddy member</p>
+          <p className="shared-profile-caption">HeyBuddy member</p>
         </>}
-        <a className="shared-profile-open" href="/">Open HelloBuddy</a>
+        <a className="shared-profile-open" href="/">Open HeyBuddy</a>
       </section>
     </main>
   );

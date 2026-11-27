@@ -1,5 +1,5 @@
 {
-  "name": "hellobuddy",
+  "name": "heybuddy",
   "private": true,
   "scripts": {
     "setup": "npm --prefix client install && npm --prefix server install",

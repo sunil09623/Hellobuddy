@@ -699,7 +699,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     const localOnly = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
     if (!localOnly && typeof navigator.share === 'function') {
       try {
-        await navigator.share({ title: `${user.firstName || user.username} on HelloBuddy`, text: 'Connect with me on HelloBuddy.', url: link });
+        await navigator.share({ title: `${user.firstName || user.username} on HeyBuddy`, text: 'Connect with me on HeyBuddy.', url: link });
         return;
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') return;
@@ -760,7 +760,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   return (
     <main className={`layout ${active ? 'mobile-chat-open' : ''}`}>
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HelloBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
+        <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HeyBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
         <div className="profile-row">
           <button type="button" className="avatar profile-avatar profile-avatar-trigger" style={{ backgroundColor: user.avatarColor || '#5524c8' }} aria-label="Edit profile" title="Edit profile" onClick={() => setProfileEditorOpen(true)}>
             {user.avatarData ? <img src={user.avatarData} alt=""/> : `${user.firstName?.trim().charAt(0) || ''}${user.lastName?.trim().charAt(0) || ''}`.toUpperCase() || user.username[0]?.toUpperCase()}
@@ -774,7 +774,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
             <button type="button" aria-label="Close share profile" onClick={() => {setProfileShareLink('');setProfileShareMessage('');}}><X size={16}/></button>
           </div>
           <p>Anyone with this link can view your username, name, and profile photo.</p>
-          {['localhost', '127.0.0.1', '::1'].includes(window.location.hostname) && <small className="profile-share-warning">Open HelloBuddy using a shared URL before sending this link to other devices.</small>}
+          {['localhost', '127.0.0.1', '::1'].includes(window.location.hostname) && <small className="profile-share-warning">Open HeyBuddy using a shared URL before sending this link to other devices.</small>}
           <div className="profile-share-copy-row">
             <input ref={profileShareInputRef} aria-label="Profile link" title="Click to copy your profile link" value={profileShareLink} readOnly onFocus={event => event.currentTarget.select()} onClick={() => void copyProfileLink()}/>
             <button type="button" onClick={() => void copyProfileLink()}>Copy</button>
