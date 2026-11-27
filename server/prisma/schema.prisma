@@ -35,6 +35,7 @@ model User {
   relationshipStatus RelationshipStatus?
   avatarData String? @db.Text
   avatarColor String @default("#5524c8") @db.VarChar(7)
+  encryptionPublicKey String? @db.Text
   passwordHash String
   createdAt DateTime @default(now())
   emailVerification EmailVerification?
@@ -70,7 +71,7 @@ model ConversationRequest {
   id String @id @default(cuid())
   requesterId String
   recipientId String
-  initialMessage String @db.VarChar(4000)
+  initialMessage String @db.Text
   status ConversationRequestStatus @default(PENDING)
   conversationId String? @unique
   createdAt DateTime @default(now())
@@ -107,7 +108,7 @@ model Message {
   clientMessageId String
   conversationId String
   senderId String
-  body String @db.VarChar(4000)
+  body String @db.Text
   createdAt DateTime @default(now())
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender User @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)

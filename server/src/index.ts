@@ -18,6 +18,13 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: process.env.CLIENT_ORIGIN, credentials: true } });
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
 const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏', '🎉', '🔥'] as const;
+const ENCRYPTED_MESSAGE_SCHEMA = z.string().max(22_040).regex(/^hb-e2ee:v1:[A-Za-z0-9_-]{16}:[A-Za-z0-9_-]{22,22000}$/);
+const ENCRYPTION_PUBLIC_KEY_SCHEMA = z.object({
+  kty: z.literal('EC'),
+  crv: z.literal('P-256'),
+  x: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  y: z.string().regex(/^[A-Za-z0-9_-]{43}$/)
+}).strict();
 const PROFILE_SELECT = {
   id: true,
   email: true,
@@ -197,6 +204,67 @@ const updateProfile: express.RequestHandler = async (req, res) => {
 };
 app.patch('/api/users/me/profile', updateProfile);
 app.patch('/api/users/me/username', updateProfile);
+app.get('/api/users/me/encryption-key', async (req, res) => {
+  const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  const [record] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
+    SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${user.id}
+  `;
+  if (!record) return res.status(404).json({ error: 'User not found' });
+  if (!record.encryptionPublicKey) return res.json({ publicKey: null });
+  try {
+    const publicKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(record.encryptionPublicKey));
+    res.json({ publicKey });
+  } catch (error) {
+    console.error('Stored encryption public key is invalid', error);
+    res.status(500).json({ error: 'Unable to load the encryption key' });
+  }
+});
+app.put('/api/users/me/encryption-key', async (req, res) => {
+  const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  const parsed = ENCRYPTION_PUBLIC_KEY_SCHEMA.safeParse(req.body?.publicKey);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid encryption public key' });
+  try {
+    const encodedKey = JSON.stringify(parsed.data);
+    const [existing] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
+      SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${user.id}
+    `;
+    if (!existing) return res.status(404).json({ error: 'User not found' });
+    if (existing.encryptionPublicKey) {
+      const savedKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(existing.encryptionPublicKey));
+      const matches = savedKey.x === parsed.data.x && savedKey.y === parsed.data.y;
+      return matches
+        ? res.json({ publicKey: savedKey })
+        : res.status(409).json({ error: 'This account has an encryption key on another browser. Use the original browser to read encrypted messages.' });
+    }
+    const updated = await prisma.$executeRaw`
+      UPDATE "User" SET "encryptionPublicKey" = ${encodedKey}
+      WHERE "id" = ${user.id} AND "encryptionPublicKey" IS NULL
+    `;
+    if (!updated) return res.status(409).json({ error: 'An encryption key was registered for this account in another browser. Use the original browser.' });
+    res.json({ publicKey: parsed.data });
+  } catch (error) {
+    console.error('Unable to register encryption public key', error);
+    res.status(500).json({ error: 'Unable to register the encryption key' });
+  }
+});
+app.get('/api/users/:id/encryption-key', async (req, res) => {
+  const user = auth(req.headers.authorization?.replace(/^Bearer /, ''));
+  if (!user) return res.status(401).json({ error: 'Unauthorized' });
+  const [target] = await prisma.$queryRaw<{ encryptionPublicKey: string | null }[]>`
+    SELECT "encryptionPublicKey" FROM "User" WHERE "id" = ${req.params.id}
+  `;
+  if (!target) return res.status(404).json({ error: 'User not found' });
+  if (!target.encryptionPublicKey) return res.status(409).json({ error: 'This contact has not initialized secure messaging yet. Ask them to sign in again.' });
+  try {
+    const publicKey = ENCRYPTION_PUBLIC_KEY_SCHEMA.parse(JSON.parse(target.encryptionPublicKey));
+    res.json({ publicKey });
+  } catch (error) {
+    console.error('Stored encryption public key is invalid', error);
+    res.status(500).json({ error: 'Unable to load the contact encryption key' });
+  }
+});
 app.get('/api/public/users/:username', async (req, res) => {
   const parsed = z.string().min(3).max(24).regex(/^[a-zA-Z0-9_]+$/).safeParse(req.params.username);
   if (!parsed.success) return res.status(404).json({ error: 'Profile not found' });
@@ -338,7 +406,11 @@ app.get('/api/conversation-requests', async (req, res) => {
 });
 app.post('/api/conversation-requests', async (req, res) => {
   const user = auth(req.headers.authorization?.replace(/^Bearer /, '')); if (!user) return res.status(401).json({ error: 'Unauthorized' });
-  const parsed = z.object({ recipientId: z.string().min(1), initialMessage: z.string().trim().min(1).max(4000) }).safeParse(req.body);
+  const parsed = z.object({
+    requestId: z.string().uuid(),
+    recipientId: z.string().min(1),
+    initialMessage: ENCRYPTED_MESSAGE_SCHEMA
+  }).safeParse(req.body);
   if (!parsed.success || parsed.data.recipientId === user.id) return res.status(400).json({ error: 'A recipient and first message are required' });
   const [recipient, block, existingConversation, reverseRequest, existingRequest] = await Promise.all([
     prisma.user.findUnique({ where: { id: parsed.data.recipientId }, select: { id: true } }),
@@ -360,7 +432,7 @@ app.post('/api/conversation-requests', async (req, res) => {
   }
   try {
     const request = await prisma.conversationRequest.create({
-      data: { requesterId: user.id, recipientId: recipient.id, initialMessage: parsed.data.initialMessage },
+      data: { id: parsed.data.requestId, requesterId: user.id, recipientId: recipient.id, initialMessage: parsed.data.initialMessage },
       include: { requester: { select: { id: true, username: true } }, recipient: { select: { id: true, username: true } } }
     });
     io.to(`user:${recipient.id}`).emit('request:new', { request });
@@ -525,7 +597,7 @@ io.on('connection', socket => {
   const user = socket.data.user as AuthUser; socket.join(`user:${user.id}`);
   socket.on('conversation:join', async ({ conversationId }) => { const member = await prisma.conversationMember.findUnique({ where: { conversationId_userId: { conversationId, userId: user.id } } }); if (member) socket.join(`conversation:${conversationId}`); });
   socket.on('message:send', async (payload, ack) => {
-    const data = z.object({ clientMessageId: z.string().uuid(), conversationId: z.string(), body: z.string().trim().min(1).max(4000) }).safeParse(payload);
+    const data = z.object({ clientMessageId: z.string().uuid(), conversationId: z.string(), body: ENCRYPTED_MESSAGE_SCHEMA }).safeParse(payload);
     if (!data.success) return ack?.({ ok: false, error: 'Invalid message' });
     const member = await prisma.conversationMember.findUnique({ where: { conversationId_userId: { conversationId: data.data.conversationId, userId: user.id } } }); if (!member) return ack?.({ ok: false, error: 'Forbidden' });
     try {

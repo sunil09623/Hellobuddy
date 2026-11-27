@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEve
 import { io, type Socket } from 'socket.io-client';
 import { ArrowLeft, Ban, Bell, BellOff, Check, Eraser, MessageCircle, MoreVertical, Search, Send, Share2, ShieldCheck, Smile, Trash2, UserRoundX, X } from 'lucide-react';
 import { API } from '../config';
+import { createLocalIdentity, decryptText, encryptText, ENCRYPTED_MESSAGE_PREFIX, loadLocalIdentity, parseEncryptionPublicKey, pinPeerPublicKey, saveLocalIdentity, type EncryptionIdentity, type EncryptionPublicKey, type EncryptionContext } from '../e2ee';
 import type { User } from '../types';
 import { ProfileEditor } from './ProfileEditor';
 
@@ -38,6 +39,8 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const [conversation, setConversation] = useState('');
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [requests, setRequests] = useState<ConversationRequest[]>([]);
+  const [encryptionReady, setEncryptionReady] = useState(false);
+  const [encryptionError, setEncryptionError] = useState('');
   const notificationStorageKey = `hellobuddy-notifications:${user.id}`;
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => window.localStorage.getItem(notificationStorageKey) !== 'false');
   const [notification, setNotification] = useState('');
@@ -67,6 +70,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const notificationAudioRef = useRef<HTMLAudioElement | null>(null);
   const notificationAudioPrimingRef = useRef(false);
   const notificationAudioPrimedRef = useRef(false);
+  const encryptionIdentityRef = useRef<EncryptionIdentity | null>(null);
+  const peerPublicKeysRef = useRef(new Map<string, EncryptionPublicKey>());
+  const activePeerIdRef = useRef('');
   const selectedRequestRef = useRef<ConversationRequest | null>(null);
   const searchRef = useRef(search);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -80,6 +86,89 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   const reactionPickerRef = useRef<HTMLDivElement>(null);
   const authHeaders = () => ({ Authorization: `Bearer ${token}` });
 
+  async function initializeEncryptionIdentity() {
+    const storedIdentity = await loadLocalIdentity(user.id);
+    const response = await fetch(`${API}/api/users/me/encryption-key`, { headers: authHeaders() });
+    const data = await response.json() as { publicKey?: unknown; error?: string };
+    if (!response.ok) throw new Error(data.error || 'Unable to load your encryption key');
+    const serverKey = data.publicKey === null || data.publicKey === undefined ? null : parseEncryptionPublicKey(data.publicKey);
+    if (storedIdentity) {
+      if (serverKey && (serverKey.x !== storedIdentity.publicKey.x || serverKey.y !== storedIdentity.publicKey.y)) {
+        throw new Error('This browser encryption key does not match the account key. Use the browser where secure messaging was set up.');
+      }
+      if (!serverKey) await registerEncryptionPublicKey(storedIdentity.publicKey);
+      return storedIdentity;
+    }
+    if (serverKey) throw new Error('This account has an encryption key on another browser. Use that browser to read encrypted messages.');
+    const identity = await createLocalIdentity(user.id);
+    await saveLocalIdentity(identity);
+    await registerEncryptionPublicKey(identity.publicKey);
+    return identity;
+  }
+
+  async function registerEncryptionPublicKey(publicKey: EncryptionPublicKey) {
+    const response = await fetch(`${API}/api/users/me/encryption-key`, {
+      method: 'PUT',
+      headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ publicKey })
+    });
+    const data = await response.json() as { error?: string };
+    if (!response.ok) throw new Error(data.error || 'Unable to register your encryption key');
+  }
+
+  async function getPeerEncryptionKey(peerId: string) {
+    const cachedKey = peerPublicKeysRef.current.get(peerId);
+    if (cachedKey) return cachedKey;
+    const response = await fetch(`${API}/api/users/${encodeURIComponent(peerId)}/encryption-key`, { headers: authHeaders() });
+    const data = await response.json() as { publicKey?: unknown; error?: string };
+    if (!response.ok || !data.publicKey) throw new Error(data.error || 'This contact has not initialized secure messaging yet.');
+    const publicKey = await pinPeerPublicKey(user.id, peerId, data.publicKey);
+    peerPublicKeysRef.current.set(peerId, publicKey);
+    return publicKey;
+  }
+
+  async function decryptMessage(message: Message, peerId: string): Promise<Message> {
+    if (!message.body.startsWith(ENCRYPTED_MESSAGE_PREFIX)) return message;
+    const identity = encryptionIdentityRef.current;
+    if (!identity) throw new Error('Secure messaging is not ready on this browser.');
+    const isRequestMessage = message.clientMessageId.startsWith('request-');
+    const context: EncryptionContext = isRequestMessage
+      ? {
+          kind: 'request',
+          requestId: message.clientMessageId.slice('request-'.length),
+          requesterId: message.senderId,
+          recipientId: message.senderId === user.id ? peerId : user.id
+        }
+      : {
+          kind: 'message',
+          conversationId: message.conversationId,
+          clientMessageId: message.clientMessageId,
+          senderId: message.senderId,
+          recipientId: message.senderId === user.id ? peerId : user.id
+        };
+    const body = await decryptText(message.body, identity, await getPeerEncryptionKey(peerId), context);
+    return { ...message, body };
+  }
+
+  async function decryptConversationRequest(request: ConversationRequest): Promise<ConversationRequest> {
+    if (!request.initialMessage.startsWith(ENCRYPTED_MESSAGE_PREFIX)) return request;
+    const identity = encryptionIdentityRef.current;
+    if (!identity) throw new Error('Secure messaging is not ready on this browser.');
+    const body = await decryptText(
+      request.initialMessage,
+      identity,
+      await getPeerEncryptionKey(request.requesterId === user.id ? request.recipientId : request.requesterId),
+      { kind: 'request', requestId: request.id, requesterId: request.requesterId, recipientId: request.recipientId }
+    );
+    return { ...request, initialMessage: body };
+  }
+
+  async function encryptMessageText(plaintext: string, context: EncryptionContext, peerId: string) {
+    const identity = encryptionIdentityRef.current;
+    if (!identity) throw new Error('Secure messaging is not ready on this browser.');
+    return encryptText(plaintext, identity, await getPeerEncryptionKey(peerId), context);
+  }
+
   const loadConversations = useCallback(async () => {
     const response = await fetch(`${API}/api/conversations`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await response.json() as Conversation[] | { error?: string };
@@ -92,9 +181,10 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     const response = await fetch(`${API}/api/conversation-requests`, { headers: { Authorization: `Bearer ${token}` } });
     const data = await response.json() as ConversationRequest[] | { error?: string };
     if (!response.ok || !Array.isArray(data)) throw new Error(!Array.isArray(data) ? data.error || 'Unable to load requests' : 'Unable to load requests');
-    setRequests(data);
-    return data;
-  }, [token]);
+    const decryptedRequests = await Promise.all(data.map(decryptConversationRequest));
+    setRequests(decryptedRequests);
+    return decryptedRequests;
+  }, [token, user.id]);
 
   const loadBlocks = useCallback(async () => {
     const response = await fetch(`${API}/api/blocks`, { headers: { Authorization: `Bearer ${token}` } });
@@ -198,6 +288,24 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }, [notificationsEnabled]);
 
   useEffect(() => {
+    let cancelled = false;
+    encryptionIdentityRef.current = null;
+    setEncryptionReady(false);
+    setEncryptionError('');
+    void initializeEncryptionIdentity().then(identity => {
+      if (cancelled) return;
+      encryptionIdentityRef.current = identity;
+      setEncryptionReady(true);
+    }).catch(err => {
+      if (cancelled) return;
+      const message = err instanceof Error ? err.message : 'Unable to initialize secure messaging';
+      setEncryptionError(message);
+      setError(message);
+    });
+    return () => { cancelled = true; };
+  }, [token, user.id]);
+
+  useEffect(() => {
     if (!notificationsEnabled) return;
     getNotificationAudio().load();
     const prepareAudioOnInteraction = () => {
@@ -277,9 +385,10 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }, [emojiPickerOpen, reactionPickerFor]);
 
   useEffect(() => {
+    if (!encryptionReady) return;
     void Promise.all([loadConversations(), loadRequests(), loadBlocks()])
       .catch(err => setError(err instanceof Error ? err.message : 'Unable to load your chats'));
-  }, [loadBlocks, loadConversations, loadRequests]);
+  }, [encryptionReady, loadBlocks, loadConversations, loadRequests]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -290,6 +399,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }, [loadPeople, search]);
 
   useEffect(() => {
+    if (!encryptionReady) return;
     const s = io(API, { auth: { token }, reconnection: true });
     setSocket(s);
     s.on('connect_error', () => setError('Live connection interrupted. Retrying automatically…'));
@@ -315,9 +425,12 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         }
       }
       if (message.conversationId !== activeConversationRef.current) return;
-      setMessages(prev => prev.some(item => item.id === message.id || item.clientMessageId === message.clientMessageId)
-        ? prev
-        : [...prev, message].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+      const peerId = activePeerIdRef.current;
+      void decryptMessage(message, peerId).then(decryptedMessage => {
+        setMessages(prev => prev.some(item => item.id === decryptedMessage.id || item.clientMessageId === decryptedMessage.clientMessageId)
+          ? prev
+          : [...prev, decryptedMessage].sort((a, b) => a.createdAt.localeCompare(b.createdAt)));
+      }).catch(err => setError(err instanceof Error ? err.message : 'Unable to decrypt this message'));
     });
     s.on('receipt:update', (update: ReceiptUpdate) => {
       if (update.userId === user.id && update.readAt) {
@@ -363,7 +476,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       void loadConversations().catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh conversations'));
     });
     s.on('request:new', (event: { request: ConversationRequest }) => {
-      setRequests(prev => [event.request, ...prev.filter(request => request.id !== event.request.id)]);
+      void decryptConversationRequest(event.request).then(request => {
+        setRequests(prev => [request, ...prev.filter(existing => existing.id !== request.id)]);
+      }).catch(err => setError(err instanceof Error ? err.message : 'Unable to decrypt this conversation request'));
       const recentRequestIds = recentIncomingRequestIdsRef.current;
       if (event.request.recipientId === user.id && event.request.status === 'PENDING' && !recentRequestIds.has(event.request.id)) {
         recentRequestIds.add(event.request.id);
@@ -397,7 +512,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
         .catch(err => setError(err instanceof Error ? err.message : 'Unable to refresh blocked users'));
     });
     return () => { s.disconnect(); setSocket(null); };
-  }, [loadBlocks, loadConversations, loadPeople, loadRequests, token, user.id]);
+  }, [encryptionReady, loadBlocks, loadConversations, loadPeople, loadRequests, token, user.id]);
 
   async function restoreConversation(conversationId: string) {
     try {
@@ -415,6 +530,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }
 
   async function showConversation(person: User, conversationId: string, prefetchedMessages?: Message[]) {
+    activePeerIdRef.current = person.id;
     setActive(person);
     setChatMode('chat');
     setSelectedRequest(null);
@@ -431,7 +547,11 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     socket?.emit('conversation:join', { conversationId });
     if (prefetchedMessages) {
       if (prefetchedMessages.length) scrollToBottomRef.current = true;
-      setMessages(prefetchedMessages);
+      try {
+        setMessages(await Promise.all(prefetchedMessages.map(message => decryptMessage(message, person.id))));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Unable to decrypt this message');
+      }
       return;
     }
     setMessages([]);
@@ -440,8 +560,9 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
       const historyData = await historyResponse.json() as Message[] | { error?: string };
       if (!historyResponse.ok || !Array.isArray(historyData)) throw new Error(!Array.isArray(historyData) ? historyData.error || 'Unable to load chat history' : 'Unable to load chat history');
       if (historyData.length) scrollToBottomRef.current = true;
-      setMessages(historyData);
-      const unread = historyData.filter(message => message.senderId !== user.id && !(message.receipts || []).find(receipt => receipt.userId === user.id)?.readAt).map(message => message.id);
+      const decryptedMessages = await Promise.all(historyData.map(message => decryptMessage(message, person.id)));
+      setMessages(decryptedMessages);
+      const unread = decryptedMessages.filter(message => message.senderId !== user.id && !(message.receipts || []).find(receipt => receipt.userId === user.id)?.readAt).map(message => message.id);
       if (unread.length) socket?.emit('receipt:read', { messageIds: unread });
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Chat load failed');
@@ -449,6 +570,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
   }
 
   async function openChat(person: User) {
+    activePeerIdRef.current = person.id;
     setActive(person);
     setMessages([]);
     setConversation('');
@@ -482,6 +604,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
 
   async function openRequest(request: ConversationRequest) {
     const person = request.requesterId === user.id ? request.recipient : request.requester;
+    activePeerIdRef.current = person.id;
     setSidebarView('requests');
     setActive(person);
     setSelectedRequest(request);
@@ -497,18 +620,26 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
 
   async function sendRequest(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!active || !draft.trim() || requestBusy) return;
+    if (!active || !draft.trim() || requestBusy || !encryptionReady) return;
     setRequestBusy(true);
     try {
+      const requestId = crypto.randomUUID();
+      const initialMessage = await encryptMessageText(draft.trim(), {
+        kind: 'request',
+        requestId,
+        requesterId: user.id,
+        recipientId: active.id
+      }, active.id);
       const response = await fetch(`${API}/api/conversation-requests`, {
         method: 'POST',
         headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ recipientId: active.id, initialMessage: draft.trim() })
+        body: JSON.stringify({ requestId, recipientId: active.id, initialMessage })
       });
       const data = await response.json() as ConversationRequest | { error?: string; request?: ConversationRequest };
       if (!response.ok || !('id' in data)) throw new Error(!('id' in data) ? data.error || 'Unable to send conversation request' : 'Unable to send conversation request');
-      setSelectedRequest(data);
-      setRequests(prev => [data, ...prev.filter(request => request.id !== data.id)]);
+      const decryptedRequest = await decryptConversationRequest(data);
+      setSelectedRequest(decryptedRequest);
+      setRequests(prev => [decryptedRequest, ...prev.filter(request => request.id !== decryptedRequest.id)]);
       setChatMode('outgoing');
       setDraft('');
     } catch (err) {
@@ -581,16 +712,42 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     }
   }
 
-  function send(event: FormEvent<HTMLFormElement>) {
+  async function send(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!draft.trim() || !active || !conversation || !socket || isBlocked) return;
+    if (!draft.trim() || !active || !conversation || !socket || isBlocked || !encryptionReady) return;
     const body = draft.trim(), clientMessageId = crypto.randomUUID();
+    const peerId = active.id;
+    let encryptedBody: string;
+    try {
+      encryptedBody = await encryptMessageText(body, {
+        kind: 'message',
+        conversationId: conversation,
+        clientMessageId,
+        senderId: user.id,
+        recipientId: peerId
+      }, peerId);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to encrypt this message');
+      return;
+    }
     const optimistic: Message = { id: `temp-${clientMessageId}`, clientMessageId, conversationId: conversation, senderId: user.id, body, createdAt: new Date().toISOString() };
     scrollToBottomRef.current = true;
     setMessages(prev => [...prev, optimistic]); setDraft('');
-    socket.emit('message:send', { clientMessageId, conversationId: conversation, body }, (ack: { ok: boolean; message?: Message; error?: string }) => {
-      if (ack.ok && ack.message) setMessages(prev => prev.map(message => message.clientMessageId === clientMessageId ? ack.message! : message));
-      else { setMessages(prev => prev.filter(message => message.clientMessageId !== clientMessageId)); setError(ack.error || 'Message failed. Please retry.'); setDraft(body); }
+    socket.emit('message:send', { clientMessageId, conversationId: conversation, body: encryptedBody }, async (ack: { ok: boolean; message?: Message; error?: string }) => {
+      if (ack.ok && ack.message) {
+        try {
+          const decryptedMessage = await decryptMessage(ack.message, peerId);
+          setMessages(prev => prev.map(message => message.clientMessageId === clientMessageId ? decryptedMessage : message));
+        } catch (err) {
+          setMessages(prev => prev.filter(message => message.clientMessageId !== clientMessageId));
+          setError(err instanceof Error ? err.message : 'Unable to decrypt the sent message');
+          setDraft(body);
+        }
+      } else {
+        setMessages(prev => prev.filter(message => message.clientMessageId !== clientMessageId));
+        setError(ack.error || 'Message failed. Please retry.');
+        setDraft(body);
+      }
     });
   }
 
@@ -761,6 +918,8 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
     <main className={`layout ${active ? 'mobile-chat-open' : ''}`}>
       <aside className="sidebar">
         <div className="brand"><span className="brand-mark"><MessageCircle size={29} strokeWidth={2.6}/></span><b>HeyBuddy</b><button type="button" className={`notification-toggle ${notificationsEnabled ? 'enabled' : ''}`} aria-label={notificationsEnabled ? 'Disable notifications' : 'Enable notifications'} aria-pressed={notificationsEnabled} title={notificationsEnabled ? 'Notifications enabled' : 'Notifications disabled'} onClick={toggleNotifications}>{notificationsEnabled ? <Bell size={19}/> : <BellOff size={19}/>}</button></div>
+        {!encryptionReady && !encryptionError && <div className="encryption-status" role="status">Setting up secure messaging…</div>}
+        {encryptionError && <div className="encryption-warning" role="alert">{encryptionError}</div>}
         <div className="profile-row">
           <button type="button" className="avatar profile-avatar profile-avatar-trigger" style={{ backgroundColor: user.avatarColor || '#5524c8' }} aria-label="Edit profile" title="Edit profile" onClick={() => setProfileEditorOpen(true)}>
             {user.avatarData ? <img src={user.avatarData} alt=""/> : `${user.firstName?.trim().charAt(0) || ''}${user.lastName?.trim().charAt(0) || ''}`.toUpperCase() || user.username[0]?.toUpperCase()}
@@ -901,7 +1060,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
               rows={1}
               disabled={isBlocked}
             />
-            <button aria-label="Send message" disabled={!draft.trim() || isBlocked}><Send size={18}/><span>Send</span></button>
+            <button aria-label="Send message" disabled={!draft.trim() || isBlocked || !encryptionReady}><Send size={18}/><span>Send</span></button>
           </form>
         </> : active && chatMode === 'incoming' && selectedRequest ? <div className="request-state">
           <div className="emptyicon"><MessageCircle size={38}/></div>
@@ -930,7 +1089,7 @@ export function Dashboard({ user, token, onUserChange, onTokenChange, onLogout }
               </div>
               <input ref={draftInputRef} value={draft} onChange={event => setDraft(event.target.value)} placeholder="Write your first message…" maxLength={4000} aria-label={`Message ${active.username}`} required/>
             </div>
-            <button aria-label="Send conversation request" disabled={!draft.trim() || requestBusy}><Send size={18}/><span>{requestBusy ? 'Sending…' : 'Send request'}</span></button>
+            <button aria-label="Send conversation request" disabled={!draft.trim() || requestBusy || !encryptionReady}><Send size={18}/><span>{requestBusy ? 'Sending…' : 'Send request'}</span></button>
           </form>
         </div> : <div className="empty">
           <div className="emptyicon"><MessageCircle size={42}/></div>

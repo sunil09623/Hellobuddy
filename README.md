@@ -27,7 +27,7 @@ docker compose up -d db
 Create the database tables:
 ```powershell
 cd server
-npx prisma migrate dev --name init
+npx prisma db push
 cd ..
 ```
 
@@ -47,6 +47,16 @@ Vite will print the web address, usually **http://localhost:5173**. API health c
 ## Mobile UI
 On narrow screens, the contacts list is shown first. Selecting a contact switches to the chat view; the back arrow returns to contacts. Desktop keeps contacts and chat side-by-side.
 
+## End-to-end encrypted messages
+
+New messages and conversation-request first messages are encrypted in the browser with AES-256-GCM before they are sent to the API. ECDH P-256 and HKDF-SHA-256 derive the shared key. The server stores and relays ciphertext; it does not decrypt message bodies. Existing messages and requests remain in their current plaintext format.
+
+Private keys are non-exportable and stored in IndexedDB for the browser that created them. Clearing that browser's site data or signing in from another browser makes encrypted messages inaccessible. A contact must sign in once after this feature is deployed before you can send them a new encrypted request.
+
+Contact public keys are trusted on first use and pinned locally. A later key change is blocked. First-use keys are supplied by the server, so this does not protect against a malicious server substituting a key during the first exchange. This design also does not provide forward secrecy.
+
+Before deploying the API update to an existing database, run `npx prisma db push` from `server` to add the public-key column and widen message storage columns. Deploy the API/schema before the client; otherwise clients cannot initialize secure messaging.
+
 ## Stack
 React + TypeScript + Vite, Express + TypeScript, Socket.IO, Prisma, PostgreSQL.\n
 ## Before public deployment
@@ -59,7 +69,7 @@ This starter still needs a security/reliability review and more tests before pro
 3. Copy the **direct** connection string into `server/.env` as `DIRECT_URL` (non-pooler host). Prisma uses this for schema migrations.
 4. Generate a strong random `JWT_SECRET` and set it in `server/.env`. Never commit `.env`.
 5. From the project root: `npm run setup`.
-6. From `server`: `npx prisma generate` then `npx prisma migrate deploy` (for an existing migration history). For a fresh development database without committed migrations, use `npx prisma migrate dev --name init`.
+6. From `server`: run `npx prisma generate` and `npx prisma db push` to synchronize the database schema. This repository does not include a complete Prisma migration history.
 7. Run the backend with `npm run dev` from the server directory; run the frontend with `npm run dev` from client.
 
 Do not use the actual database password in source code or in screenshots. For hosted deployment, configure `DATABASE_URL`, `DIRECT_URL`, and `JWT_SECRET` as host environment variables/secrets, and set `CLIENT_ORIGIN` to the deployed frontend URL.
