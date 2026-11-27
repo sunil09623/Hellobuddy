@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+enum ConversationRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+enum Gender {
+  FEMALE
+  MALE
+  NON_BINARY
+  OTHER
+  PREFER_NOT_TO_SAY
+}
+enum RelationshipStatus {
+  SINGLE
+  MARRIED
+  HIDDEN
+}
+model User {
+  id String @id @default(cuid())
+  email String @unique
+  username String @unique
+  phoneNumber String? @db.VarChar(24)
+  firstName String? @db.VarChar(80)
+  lastName String? @db.VarChar(80)
+  gender Gender?
+  dateOfBirth DateTime? @db.Date
+  relationshipStatus RelationshipStatus?
+  avatarData String? @db.Text
+  avatarColor String @default("#5524c8") @db.VarChar(7)
+  passwordHash String
+  createdAt DateTime @default(now())
+  emailVerification EmailVerification?
+  sentMessages Message[] @relation("SentMessages")
+  reactions MessageReaction[]
+  receipts MessageReceipt[]
+  memberships ConversationMember[]
+  sentRequests ConversationRequest[] @relation("RequestSender")
+  receivedRequests ConversationRequest[] @relation("RequestRecipient")
+  blocksCreated UserBlock[] @relation("Blocker")
+  blocksReceived UserBlock[] @relation("Blocked")
+}
+model EmailVerification {
+  userId String @id
+  email String
+  codeHash String
+  expiresAt DateTime
+  lastSentAt DateTime @default(now())
+  attempts Int @default(0)
+  verifiedAt DateTime?
+  consumedAt DateTime?
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@index([email, expiresAt])
+}
+model Conversation {
+  id String @id @default(cuid())
+  createdAt DateTime @default(now())
+  members ConversationMember[]
+  messages Message[]
+  request ConversationRequest?
+}
+model ConversationRequest {
+  id String @id @default(cuid())
+  requesterId String
+  recipientId String
+  initialMessage String @db.VarChar(4000)
+  status ConversationRequestStatus @default(PENDING)
+  conversationId String? @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  requester User @relation("RequestSender", fields: [requesterId], references: [id], onDelete: Cascade)
+  recipient User @relation("RequestRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+  conversation Conversation? @relation(fields: [conversationId], references: [id], onDelete: SetNull)
+  @@unique([requesterId, recipientId])
+  @@index([recipientId, status, createdAt])
+  @@index([requesterId, status, createdAt])
+}
+model UserBlock {
+  blockerId String
+  blockedId String
+  createdAt DateTime @default(now())
+  blocker User @relation("Blocker", fields: [blockerId], references: [id], onDelete: Cascade)
+  blocked User @relation("Blocked", fields: [blockedId], references: [id], onDelete: Cascade)
+  @@id([blockerId, blockedId])
+  @@index([blockedId])
+}
+model ConversationMember {
+  conversationId String
+  userId String
+  joinedAt DateTime @default(now())
+  clearedAt DateTime?
+  deletedAt DateTime?
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([conversationId, userId])
+  @@index([userId])
+}
+model Message {
+  id String @id @default(cuid())
+  clientMessageId String
+  conversationId String
+  senderId String
+  body String @db.VarChar(4000)
+  createdAt DateTime @default(now())
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender User @relation("SentMessages", fields: [senderId], references: [id], onDelete: Cascade)
+  receipts MessageReceipt[]
+  reactions MessageReaction[]
+  @@unique([senderId, clientMessageId])
+  @@index([conversationId, createdAt, id])
+  @@index([senderId, createdAt])
+}
+model MessageReaction {
+  messageId String
+  userId String
+  emoji String @db.VarChar(16)
+  createdAt DateTime @default(now())
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([messageId, userId, emoji])
+  @@index([messageId])
+}
+model MessageReceipt {
+  messageId String
+  userId String
+  deliveredAt DateTime?
+  readAt DateTime?
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@id([messageId, userId])
+  @@index([userId, deliveredAt, readAt])
+}
